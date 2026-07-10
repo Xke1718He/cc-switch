@@ -10,6 +10,7 @@ use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
+use crate::runtime::AppHandle;
 use crate::services::provider::{
     build_effective_provider_for_live_with_codex_oauth_manager,
     build_effective_settings_with_common_config,
@@ -18,7 +19,6 @@ use crate::services::provider::{
 use serde_json::{json, Map, Value};
 use std::str::FromStr;
 use std::sync::Arc;
-use tauri::Emitter;
 use tokio::sync::RwLock;
 
 /// 用于接管 Live 配置时的占位符（避免客户端提示缺少 key，同时不泄露真实 Token）
@@ -391,7 +391,7 @@ pub struct ProxyService {
     codex_oauth_manager: Arc<CodexOAuthManager>,
     server: Arc<RwLock<Option<ProxyServer>>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
-    app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    app_handle: Arc<RwLock<Option<AppHandle>>>,
     switch_locks: SwitchLockManager,
 }
 
@@ -915,7 +915,7 @@ impl ProxyService {
     }
 
     /// 设置 AppHandle（在应用初始化时调用）
-    pub fn set_app_handle(&self, handle: tauri::AppHandle) {
+    pub fn set_app_handle(&self, handle: AppHandle) {
         futures::executor::block_on(async {
             *self.app_handle.write().await = Some(handle);
         });
@@ -1292,7 +1292,9 @@ impl ProxyService {
                             &app, &provider,
                         )
                     {
+                        #[cfg(feature = "desktop")]
                         if let Some(handle) = self.app_handle.read().await.as_ref() {
+                            use tauri::Emitter;
                             let _ = handle.emit(
                                 "proxy-official-warning",
                                 serde_json::json!({

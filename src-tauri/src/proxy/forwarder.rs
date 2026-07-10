@@ -22,9 +22,15 @@ use super::{
     types::{CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig},
     ProxyError,
 };
+#[cfg(feature = "desktop")]
 use crate::commands::{CodexOAuthState, CopilotAuthState, XaiOAuthState};
+#[cfg(feature = "desktop")]
+use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
+#[cfg(feature = "desktop")]
 use crate::proxy::providers::copilot_auth::CopilotAuthManager;
+#[cfg(feature = "desktop")]
 use crate::proxy::providers::xai_oauth_auth::XaiOAuthManager;
+use crate::runtime::AppHandle;
 use crate::{
     app_config::AppType,
     provider::{LocalProxyRequestOverrides, Provider},
@@ -34,6 +40,7 @@ use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
 use std::sync::Arc;
+#[cfg(feature = "desktop")]
 use tauri::Manager;
 use tokio::sync::RwLock;
 
@@ -165,7 +172,7 @@ pub struct RequestForwarder {
     /// 故障转移切换管理器
     failover_manager: Arc<FailoverSwitchManager>,
     /// AppHandle，用于发射事件和更新托盘
-    app_handle: Option<tauri::AppHandle>,
+    app_handle: Option<AppHandle>,
     /// 请求开始时的"当前供应商 ID"（用于判断是否需要同步 UI/托盘）
     current_provider_id_at_start: String,
     /// 代理会话 ID（用于 Gemini Native shadow replay）
@@ -245,7 +252,7 @@ impl RequestForwarder {
         gemini_shadow: Arc<GeminiShadowStore>,
         codex_chat_history: Arc<CodexChatHistoryStore>,
         failover_manager: Arc<FailoverSwitchManager>,
-        app_handle: Option<tauri::AppHandle>,
+        app_handle: Option<AppHandle>,
         current_provider_id_at_start: String,
         session_id: String,
         session_client_provided: bool,
@@ -1391,6 +1398,7 @@ impl RequestForwarder {
 
         // GitHub Copilot 动态 endpoint 路由
         // 从 CopilotAuthManager 获取缓存的 API endpoint（支持企业版等非默认 endpoint）
+        #[cfg(feature = "desktop")]
         if is_copilot && !is_full_url {
             if let Some(app_handle) = &self.app_handle {
                 let copilot_state = app_handle.state::<CopilotAuthState>();
@@ -1712,7 +1720,18 @@ impl RequestForwarder {
         // 精确认证材料。实际日志永远不输出这些值。
         let mut log_secrets: Vec<String> = Vec::new();
         let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
+            #[cfg(not(feature = "desktop"))]
+            if matches!(
+                auth.strategy,
+                AuthStrategy::GitHubCopilot | AuthStrategy::CodexOAuth
+            ) {
+                return Err(ProxyError::AuthError(
+                    "Managed account authentication is not available in headless mode".to_string(),
+                ));
+            }
+
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
+            #[cfg(feature = "desktop")]
             if auth.strategy == AuthStrategy::GitHubCopilot {
                 if let Some(app_handle) = &self.app_handle {
                     let copilot_state = app_handle.state::<CopilotAuthState>();
@@ -1764,6 +1783,7 @@ impl RequestForwarder {
             }
 
             // Codex OAuth 特殊处理：从 CodexOAuthManager 获取真实 access_token
+            #[cfg(feature = "desktop")]
             if auth.strategy == AuthStrategy::CodexOAuth {
                 if let Some(app_handle) = &self.app_handle {
                     let codex_state = app_handle.state::<CodexOAuthState>();
@@ -2677,6 +2697,7 @@ impl RequestForwarder {
 
     /// 用 Copilot live `/models` 列表确认 model ID 真实可用，找不到时按 family 降级。
     /// 命中缓存后是同步的；首次请求或 5 min 缓存过期后会触发一次 HTTP。
+    #[cfg(feature = "desktop")]
     async fn apply_copilot_live_model_resolution(
         &self,
         provider: &Provider,
@@ -2718,6 +2739,15 @@ impl RequestForwarder {
         }
     }
 
+    #[cfg(not(feature = "desktop"))]
+    async fn apply_copilot_live_model_resolution(
+        &self,
+        _provider: &Provider,
+        _body: &mut serde_json::Value,
+    ) {
+    }
+
+    #[cfg(feature = "desktop")]
     async fn is_copilot_openai_vendor_model(&self, provider: &Provider, model_id: &str) -> bool {
         let Some(app_handle) = &self.app_handle else {
             log::debug!("[Copilot] AppHandle unavailable, fallback to chat/completions");
@@ -2773,6 +2803,10 @@ impl RequestForwarder {
             return ErrorCategory::NonRetryable;
         }
 
+    #[cfg(not(feature = "desktop"))]
+    async fn is_copilot_openai_vendor_model(&self, _provider: &Provider, _model_id: &str) -> bool {
+        false
+    }
         match error {
             // 网络和上游错误：都应该尝试下一个供应商
             ProxyError::Timeout(_) => ErrorCategory::Retryable,

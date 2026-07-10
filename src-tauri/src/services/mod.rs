@@ -15,6 +15,7 @@ pub mod prompt;
 pub mod provider;
 pub mod proxy;
 pub mod s3;
+#[cfg(feature = "desktop")]
 pub mod s3_auto_sync;
 pub mod s3_sync;
 pub mod session_usage;
@@ -33,6 +34,7 @@ pub mod sync_protocol;
 pub mod usage_cache;
 pub mod usage_stats;
 pub mod webdav;
+#[cfg(feature = "desktop")]
 pub mod webdav_auto_sync;
 pub mod webdav_sync;
 
