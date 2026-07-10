@@ -6,9 +6,9 @@
 //! - 前端事件发射
 
 use crate::error::AppError;
+use crate::runtime::AppHandle;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
 use tokio::sync::RwLock;
 
 /// 故障转移切换管理器
@@ -37,7 +37,7 @@ impl FailoverSwitchManager {
     /// - `Err(e)` - 切换过程中发生错误
     pub async fn try_switch(
         &self,
-        app_handle: Option<&tauri::AppHandle>,
+        app_handle: Option<&AppHandle>,
         app_type: &str,
         provider_id: &str,
         provider_name: &str,
@@ -70,7 +70,7 @@ impl FailoverSwitchManager {
 
     async fn do_switch(
         &self,
-        app_handle: Option<&tauri::AppHandle>,
+        app_handle: Option<&AppHandle>,
         app_type: &str,
         provider_id: &str,
         provider_name: &str,
@@ -88,7 +88,9 @@ impl FailoverSwitchManager {
 
         let mut switched = false;
 
+        #[cfg(feature = "desktop")]
         if let Some(app) = app_handle {
+            use tauri::{Emitter, Manager};
             if let Some(app_state) = app.try_state::<crate::store::AppState>() {
                 // 只换代理的路由，不写客户端文件。
                 switched = crate::mode::controller::record_failover_route(

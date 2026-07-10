@@ -9,10 +9,12 @@ use crate::provider::Provider;
 use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
+use crate::runtime::AppHandle;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tauri::Emitter;
 use tokio::sync::RwLock;
+#[cfg(feature = "desktop")]
+use tauri::Emitter;
 
 use crate::live::project::claude::PROXY_TOKEN_PLACEHOLDER;
 
@@ -21,7 +23,7 @@ pub struct ProxyService {
     db: Arc<Database>,
     server: Arc<RwLock<Option<ProxyServer>>>,
     /// AppHandle，用于传递给 ProxyServer 以支持故障转移时的 UI 更新
-    app_handle: Arc<RwLock<Option<tauri::AppHandle>>>,
+    app_handle: Arc<RwLock<Option<AppHandle>>>,
     switch_locks: SwitchLockManager,
 }
 
@@ -67,7 +69,7 @@ impl ProxyService {
     }
 
     /// 设置 AppHandle（在应用初始化时调用）
-    pub fn set_app_handle(&self, handle: tauri::AppHandle) {
+    pub fn set_app_handle(&self, handle: AppHandle) {
         futures::executor::block_on(async {
             *self.app_handle.write().await = Some(handle);
         });
@@ -96,6 +98,7 @@ impl ProxyService {
 
     /// 托盘在后台线程比对、变了才重建，这里不等它。
     async fn notify_tray(&self) {
+        #[cfg(feature = "desktop")]
         if let Some(handle) = self.app_handle.read().await.as_ref() {
             crate::tray::schedule_tray_status_check(handle);
         }
@@ -212,6 +215,7 @@ impl ProxyService {
     }
 
     pub(crate) async fn emit(&self, event: &str, payload: Value) {
+        #[cfg(feature = "desktop")]
         if let Some(handle) = self.app_handle.read().await.as_ref() {
             if let Err(error) = handle.emit(event, payload) {
                 log::warn!("发送事件 {event} 失败: {error}");

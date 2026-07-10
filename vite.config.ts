@@ -3,36 +3,81 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { codeInspectorPlugin } from "code-inspector-plugin";
 
-export default defineConfig(({ command }) => ({
-  root: "src",
-  plugins: [
-    command === "serve" &&
-      codeInspectorPlugin({
-        bundler: "vite",
-      }),
-    react(),
-  ].filter(Boolean),
-  base: "./",
-  build: {
-    outDir: "../dist",
-    emptyOutDir: true,
-    rollupOptions: {
-      // 托盘面板是单独的入口，不加载主界面
-      input: {
-        main: path.resolve(__dirname, "src/index.html"),
-        "tray-panel": path.resolve(__dirname, "src/tray-panel.html"),
+export default defineConfig(({ command, mode }) => {
+  const webMode = mode === "web" || process.env.CC_SWITCH_WEB === "1";
+  const webAliases = webMode
+    ? {
+        "@tauri-apps/api/core": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-core.ts",
+        ),
+        "@tauri-apps/api/event": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-event.ts",
+        ),
+        "@tauri-apps/api/window": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-window.ts",
+        ),
+        "@tauri-apps/api/path": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-path.ts",
+        ),
+        "@tauri-apps/api/app": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-app.ts",
+        ),
+        "@tauri-apps/plugin-dialog": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-dialog.ts",
+        ),
+        "@tauri-apps/plugin-process": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-process.ts",
+        ),
+        "@tauri-apps/plugin-updater": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-updater.ts",
+        ),
+      }
+    : {};
+
+  return {
+    root: "src",
+    plugins: [
+      command === "serve" &&
+        codeInspectorPlugin({
+          bundler: "vite",
+        }),
+      react(),
+    ].filter(Boolean),
+    base: "./",
+    build: {
+      outDir: "../dist",
+      emptyOutDir: true,
+      rollupOptions: webMode ? undefined : {
+        input: {
+          main: path.resolve(__dirname, "src/index.html"),
+          "tray-panel": path.resolve(__dirname, "src/tray-panel.html"),
+        },
       },
     },
-  },
-  server: {
-    port: 3000,
-    strictPort: true,
-  },
-  resolve: {
-    alias: {
-      "@": path.resolve(__dirname, "./src"),
+    server: {
+      port: 3000,
+      strictPort: true,
+      proxy: webMode
+        ? {
+            "/api": "http://127.0.0.1:31235",
+          }
+        : undefined,
     },
-  },
-  clearScreen: false,
-  envPrefix: ["VITE_", "TAURI_"],
-}));
+    resolve: {
+      alias: {
+        "@": path.resolve(__dirname, "./src"),
+        ...webAliases,
+      },
+    },
+    clearScreen: false,
+    envPrefix: ["VITE_", "TAURI_"],
+  };
+});

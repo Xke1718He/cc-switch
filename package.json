@@ -5,7 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",
+    "dev:web": "vite --mode web",
+    "dev:web:server": "cargo run --manifest-path src-tauri/Cargo.toml --no-default-features --features headless --bin cc-switchd",
     "build": "pnpm tauri build",
+    "build:web": "vite build --mode web",
+    "package:web:deb": "bash scripts/package-web-deb.sh",
     "tauri": "tauri",
     "dev:renderer": "vite",
     "build:renderer": "vite build",
