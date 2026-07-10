@@ -1,8 +1,11 @@
 use crate::app_config::AppType;
+use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::services::profile::{ProfilePayload, ProfileService};
-use crate::services::{McpService, PromptService, ProviderService, SkillService, SpeedtestService};
+use crate::services::{
+    McpService, OmoService, PromptService, ProviderService, SkillService, SpeedtestService,
+};
 use crate::store::AppState;
 use axum::{
     extract::{Path, State},
@@ -19,6 +22,7 @@ use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -107,6 +111,70 @@ struct ModelPricingInfo {
     cache_creation_cost_per_million: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyTestResult {
+    success: bool,
+    latency_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpstreamProxyStatus {
+    enabled: bool,
+    proxy_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DetectedProxy {
+    url: String,
+    proxy_type: String,
+    port: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolVersion {
+    name: String,
+    version: Option<String>,
+    latest_version: Option<String>,
+    error: Option<String>,
+    installed_but_broken: bool,
+    env_type: String,
+    wsl_distro: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WslShellPreferenceInput {
+    #[serde(default)]
+    wsl_shell: Option<String>,
+    #[serde(default)]
+    wsl_shell_flag: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DailyMemoryFileInfo {
+    filename: String,
+    date: String,
+    size_bytes: u64,
+    modified_at: u64,
+    preview: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DailyMemorySearchResult {
+    filename: String,
+    date: String,
+    size_bytes: u64,
+    modified_at: u64,
+    snippet: String,
+    match_count: usize,
+}
+
 pub async fn run(config: WebServerConfig, app_state: Arc<AppState>) -> Result<(), AppError> {
     let state = WebState { app_state };
     let app = build_router(config.ui_dir, state);
@@ -177,6 +245,10 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             crate::settings::update_settings(settings)?;
             ok(true)
         }
+        "has_codex_unify_history_backup" => {
+            ok(crate::codex_history_migration::has_codex_official_history_unify_backup())
+        }
+        "restore_codex_unified_history" => ok(restore_codex_unified_history().await?),
         "is_portable_mode" => ok(is_portable_mode()),
         "get_config_dir" => ok(get_config_dir(arg_string(&args, &["app"])?)),
         "get_app_config_path" => ok(crate::config::get_app_config_path()
@@ -189,7 +261,16 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
         "set_app_config_dir_override" => Err(AppError::Config(
             "app config directory override is not available in web mode".to_string(),
         )),
-        "check_for_updates" | "restart_app" | "install_update_and_restart" => ok(false),
+        "check_for_updates"
+        | "restart_app"
+        | "install_update_and_restart"
+        | "set_auto_launch"
+        | "get_auto_launch_status" => ok(false),
+        "apply_claude_plugin_config" => Err(AppError::Config(
+            "Claude plugin config is not available in headless web mode".to_string(),
+        )),
+        "apply_claude_onboarding_skip" => ok(crate::claude_mcp::set_has_completed_onboarding()?),
+        "clear_claude_onboarding_skip" => ok(crate::claude_mcp::clear_has_completed_onboarding()?),
 
         "get_providers" => {
             let app = app_type(&args, "app")?;
@@ -298,6 +379,76 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
             ok(ProviderService::query_usage(state, app, &provider_id).await?)
         }
+        "testUsageScript" => {
+            let app = app_type(&args, "app")?;
+            let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
+            let script_code = arg_string(&args, &["scriptCode", "script_code"])?;
+            ok(ProviderService::test_usage_script(
+                state,
+                app,
+                &provider_id,
+                &script_code,
+                arg_u64_opt(&args, &["timeout"])?.unwrap_or(10),
+                arg_string_opt(&args, &["apiKey", "api_key"]).as_deref(),
+                arg_string_opt(&args, &["baseUrl", "base_url"]).as_deref(),
+                arg_string_opt(&args, &["accessToken", "access_token"]).as_deref(),
+                arg_string_opt(&args, &["userId", "user_id"]).as_deref(),
+                arg_string_opt(&args, &["templateType", "template_type"]).as_deref(),
+            )
+            .await?)
+        }
+        "fetch_models_for_config" => {
+            let base_url = arg_string(&args, &["baseUrl", "base_url"])?;
+            let api_key = arg_string(&args, &["apiKey", "api_key"])?;
+            let is_full_url = arg_bool_opt(&args, &["isFullUrl", "is_full_url"])?.unwrap_or(false);
+            let models_url = arg_string_opt(&args, &["modelsUrl", "models_url"]);
+            let custom_user_agent =
+                arg_string_opt(&args, &["customUserAgent", "custom_user_agent"]);
+            let user_agent = crate::provider::parse_custom_user_agent(custom_user_agent.as_deref())
+                .ok()
+                .flatten();
+            ok(crate::services::model_fetch::fetch_models(
+                &base_url,
+                &api_key,
+                is_full_url,
+                models_url.as_deref(),
+                user_agent,
+            )
+            .await
+            .map_err(AppError::Config)?)
+        }
+        "get_balance" => {
+            let base_url = arg_string(&args, &["baseUrl", "base_url"])?;
+            let api_key = arg_string(&args, &["apiKey", "api_key"])?;
+            ok(crate::services::balance::get_balance(&base_url, &api_key)
+                .await
+                .map_err(AppError::Config)?)
+        }
+        "get_coding_plan_quota" => {
+            let base_url = arg_string(&args, &["baseUrl", "base_url"])?;
+            let api_key = arg_string(&args, &["apiKey", "api_key"])?;
+            ok(crate::services::coding_plan::get_coding_plan_quota(
+                &base_url,
+                &api_key,
+                arg_string_opt(&args, &["accessKeyId", "access_key_id"]).as_deref(),
+                arg_string_opt(&args, &["secretAccessKey", "secret_access_key"]).as_deref(),
+                arg_string_opt(&args, &["codingPlanProvider", "coding_plan_provider"]).as_deref(),
+                arg_string_opt(&args, &["teamOrganizationId", "team_organization_id"]).as_deref(),
+                arg_string_opt(&args, &["teamProjectId", "team_project_id"]).as_deref(),
+            )
+            .await
+            .map_err(AppError::Config)?)
+        }
+        "get_subscription_quota" => {
+            let tool = arg_string(&args, &["tool"])?;
+            let quota = crate::services::subscription::get_subscription_quota(&tool)
+                .await
+                .map_err(AppError::Config)?;
+            if let Ok(app_type) = AppType::from_str(&tool) {
+                state.usage_cache.put_subscription(app_type, quota.clone());
+            }
+            ok(quota)
+        }
 
         "get_universal_providers" => ok(ProviderService::list_universal(state)?),
         "get_universal_provider" => {
@@ -354,6 +505,61 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
             ok(crate::hermes_config::get_provider(&provider_id)?)
         }
+        "scan_openclaw_config_health" => ok(crate::openclaw_config::scan_openclaw_config_health()?),
+        "get_openclaw_default_model" => ok(crate::openclaw_config::get_default_model()?),
+        "set_openclaw_default_model" => {
+            let model = take::<crate::openclaw_config::OpenClawDefaultModel>(&args, "model")?;
+            ok(crate::openclaw_config::set_default_model(&model)?)
+        }
+        "get_openclaw_model_catalog" => ok(crate::openclaw_config::get_model_catalog()?),
+        "set_openclaw_model_catalog" => {
+            let catalog = take::<
+                HashMap<String, crate::openclaw_config::OpenClawModelCatalogEntry>,
+            >(&args, "catalog")?;
+            ok(crate::openclaw_config::set_model_catalog(&catalog)?)
+        }
+        "get_openclaw_agents_defaults" => ok(crate::openclaw_config::get_agents_defaults()?),
+        "set_openclaw_agents_defaults" => {
+            let defaults =
+                take::<crate::openclaw_config::OpenClawAgentsDefaults>(&args, "defaults")?;
+            ok(crate::openclaw_config::set_agents_defaults(&defaults)?)
+        }
+        "get_openclaw_env" => ok(crate::openclaw_config::get_env_config()?),
+        "set_openclaw_env" => {
+            let env = take::<crate::openclaw_config::OpenClawEnvConfig>(&args, "env")?;
+            ok(crate::openclaw_config::set_env_config(&env)?)
+        }
+        "get_openclaw_tools" => ok(crate::openclaw_config::get_tools_config()?),
+        "set_openclaw_tools" => {
+            let tools = take::<crate::openclaw_config::OpenClawToolsConfig>(&args, "tools")?;
+            ok(crate::openclaw_config::set_tools_config(&tools)?)
+        }
+        "get_hermes_model_config" => ok(crate::hermes_config::get_model_config()?),
+        "get_hermes_memory" => {
+            let kind = take::<crate::hermes_config::MemoryKind>(&args, "kind")?;
+            ok(crate::hermes_config::read_memory(kind)?)
+        }
+        "set_hermes_memory" => {
+            let kind = take::<crate::hermes_config::MemoryKind>(&args, "kind")?;
+            let content = arg_string(&args, &["content"])?;
+            crate::hermes_config::write_memory(kind, &content)?;
+            ok(())
+        }
+        "get_hermes_memory_limits" => ok(crate::hermes_config::read_memory_limits()?),
+        "set_hermes_memory_enabled" => {
+            let kind = take::<crate::hermes_config::MemoryKind>(&args, "kind")?;
+            let enabled = arg_bool(&args, &["enabled"])?;
+            ok(crate::hermes_config::set_memory_enabled(kind, enabled)?)
+        }
+        "open_hermes_web_ui" => {
+            let path = arg_string_opt(&args, &["path"]);
+            probe_hermes_web_ui(path).await?;
+            ok(true)
+        }
+        "launch_hermes_dashboard" => Err(AppError::Config(
+            "launching a native terminal is not available in web mode; run `hermes dashboard` manually"
+                .to_string(),
+        )),
 
         "start_proxy_server" => ok(state
             .proxy_service
@@ -529,6 +735,38 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
                 .await?
                 .auto_failover_enabled)
         }
+        "set_auto_failover_enabled" => {
+            let app_type = arg_string(&args, &["appType", "app_type"])?;
+            let enabled = arg_bool(&args, &["enabled"])?;
+            set_auto_failover_enabled_web(state, app_type, enabled).await?;
+            ok(())
+        }
+        "reset_circuit_breaker" => {
+            let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
+            let app_type = arg_string(&args, &["appType", "app_type"])?;
+            state
+                .db
+                .update_provider_health(&provider_id, &app_type, true, None)
+                .await?;
+            state
+                .proxy_service
+                .reset_provider_circuit_breaker(&provider_id, &app_type)
+                .await
+                .map_err(AppError::Config)?;
+            ok(())
+        }
+        "get_circuit_breaker_config" => ok(state.db.get_circuit_breaker_config().await?),
+        "update_circuit_breaker_config" => {
+            let config = take::<crate::proxy::CircuitBreakerConfig>(&args, "config")?;
+            state.db.update_circuit_breaker_config(&config).await?;
+            state
+                .proxy_service
+                .update_circuit_breaker_configs(config)
+                .await
+                .map_err(AppError::Config)?;
+            ok(())
+        }
+        "get_circuit_breaker_stats" => ok(None::<crate::proxy::CircuitBreakerStats>),
 
         "get_common_config_snippet" => {
             let app_type = arg_string(&args, &["appType", "app_type"])?;
@@ -579,6 +817,127 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             crate::proxy::http_client::apply_proxy(normalized)
                 .map_err(|e| AppError::Config(e.to_string()))?;
             ok(())
+        }
+        "test_proxy_url" => {
+            let url = arg_string(&args, &["url"])?;
+            ok(test_proxy_url(url).await?)
+        }
+        "get_upstream_proxy_status" => ok(UpstreamProxyStatus {
+            enabled: crate::proxy::http_client::get_current_proxy_url().is_some(),
+            proxy_url: crate::proxy::http_client::get_current_proxy_url(),
+        }),
+        "scan_local_proxies" => ok(scan_local_proxies()),
+
+        "export_config_to_file" => {
+            let file_path = arg_string(&args, &["filePath", "file_path"])?;
+            ok(export_config_to_file(state, file_path).await?)
+        }
+        "import_config_from_file" => {
+            let file_path = arg_string(&args, &["filePath", "file_path"])?;
+            ok(import_config_from_file(state, file_path).await?)
+        }
+        "sync_current_providers_live" => ok(sync_current_providers_live(state).await?),
+        "create_db_backup" => ok(create_db_backup(state).await?),
+        "list_db_backups" => ok(Database::list_backups()?),
+        "restore_db_backup" => {
+            let filename = arg_string(&args, &["filename"])?;
+            ok(restore_db_backup(state, filename).await?)
+        }
+        "rename_db_backup" => {
+            let old_filename = arg_string(&args, &["oldFilename", "old_filename"])?;
+            let new_name = arg_string(&args, &["newName", "new_name"])?;
+            ok(Database::rename_backup(&old_filename, &new_name)?)
+        }
+        "delete_db_backup" => {
+            let filename = arg_string(&args, &["filename"])?;
+            Database::delete_backup(&filename)?;
+            ok(())
+        }
+        "open_file_dialog" | "save_file_dialog" | "pick_directory" => Err(AppError::Config(
+            "native file dialogs are not available in web mode; provide a local path explicitly"
+                .to_string(),
+        )),
+
+        "webdav_test_connection" => {
+            let settings = take::<crate::settings::WebDavSyncSettings>(&args, "settings")?;
+            let preserve_empty =
+                arg_bool_opt(&args, &["preserveEmptyPassword", "preserve_empty_password"])?
+                    .unwrap_or(true);
+            ok(webdav_test_connection(settings, preserve_empty).await?)
+        }
+        "webdav_sync_save_settings" => {
+            let settings = take::<crate::settings::WebDavSyncSettings>(&args, "settings")?;
+            let password_touched =
+                arg_bool_opt(&args, &["passwordTouched", "password_touched"])?.unwrap_or(false);
+            ok(webdav_sync_save_settings(settings, password_touched)?)
+        }
+        "webdav_sync_upload" => ok(webdav_sync_upload(state).await?),
+        "webdav_sync_download" => ok(webdav_sync_download(state).await?),
+        "webdav_sync_fetch_remote_info" => ok(webdav_sync_fetch_remote_info().await?),
+        "s3_test_connection" => {
+            let settings = take::<crate::settings::S3SyncSettings>(&args, "settings")?;
+            let preserve_empty =
+                arg_bool_opt(&args, &["preserveEmptyPassword", "preserve_empty_password"])?
+                    .unwrap_or(true);
+            ok(s3_test_connection(settings, preserve_empty).await?)
+        }
+        "s3_sync_save_settings" => {
+            let settings = take::<crate::settings::S3SyncSettings>(&args, "settings")?;
+            let password_touched =
+                arg_bool_opt(&args, &["passwordTouched", "password_touched"])?.unwrap_or(false);
+            ok(s3_sync_save_settings(settings, password_touched)?)
+        }
+        "s3_sync_upload" => ok(s3_sync_upload(state).await?),
+        "s3_sync_download" => ok(s3_sync_download(state).await?),
+        "s3_sync_fetch_remote_info" => ok(s3_sync_fetch_remote_info().await?),
+
+        "get_rectifier_config" => ok(state.db.get_rectifier_config()?),
+        "set_rectifier_config" => {
+            let config = take::<crate::proxy::types::RectifierConfig>(&args, "config")?;
+            state.db.set_rectifier_config(&config)?;
+            ok(true)
+        }
+        "get_optimizer_config" => ok(state.db.get_optimizer_config()?),
+        "set_optimizer_config" => {
+            let config = take::<crate::proxy::types::OptimizerConfig>(&args, "config")?;
+            match config.cache_ttl.as_str() {
+                "5m" | "1h" => {}
+                other => {
+                    return Err(AppError::Config(format!(
+                        "Invalid cache_ttl value: '{other}'. Allowed values: '5m', '1h'"
+                    )))
+                }
+            }
+            state.db.set_optimizer_config(&config)?;
+            ok(true)
+        }
+        "get_copilot_optimizer_config" => ok(state.db.get_copilot_optimizer_config()?),
+        "set_copilot_optimizer_config" => {
+            let config = take::<crate::proxy::types::CopilotOptimizerConfig>(&args, "config")?;
+            state.db.set_copilot_optimizer_config(&config)?;
+            ok(true)
+        }
+        "get_log_config" => ok(state.db.get_log_config()?),
+        "set_log_config" => {
+            let config = take::<crate::proxy::types::LogConfig>(&args, "config")?;
+            state.db.set_log_config(&config)?;
+            log::set_max_level(config.to_level_filter());
+            ok(true)
+        }
+        "extract_common_config_snippet" => {
+            let app = app_type_from_string(arg_string(&args, &["appType", "app_type"])?)?;
+            if let Some(settings_config) =
+                arg_string_opt(&args, &["settingsConfig", "settings_config"])
+                    .filter(|s| !s.trim().is_empty())
+            {
+                let settings = serde_json::from_str::<Value>(&settings_config)
+                    .map_err(|e| AppError::Config(e.to_string()))?;
+                ok(ProviderService::extract_common_config_snippet_from_settings(
+                    app, &settings,
+                )?)
+            } else {
+                ok(ProviderService::extract_common_config_snippet(state, app)?)
+            }
         }
 
         "get_claude_mcp_status" => ok(crate::claude_mcp::get_mcp_status()?),
@@ -679,6 +1038,47 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             ok(())
         }
         "import_mcp_from_apps" => ok(McpService::import_from_all_apps(state)?),
+
+        "read_omo_local_file" => ok(OmoService::read_local_file(&crate::services::omo::STANDARD)?),
+        "get_current_omo_provider_id" => ok(state
+            .db
+            .get_current_omo_provider("opencode", "omo")?
+            .map(|p| p.id)
+            .unwrap_or_default()),
+        "disable_current_omo" => {
+            disable_omo_variant(state, "omo", &crate::services::omo::STANDARD)?;
+            ok(())
+        }
+        "read_omo_slim_local_file" => {
+            ok(OmoService::read_local_file(&crate::services::omo::SLIM)?)
+        }
+        "get_current_omo_slim_provider_id" => ok(state
+            .db
+            .get_current_omo_provider("opencode", "omo-slim")?
+            .map(|p| p.id)
+            .unwrap_or_default()),
+        "disable_current_omo_slim" => {
+            disable_omo_variant(state, "omo-slim", &crate::services::omo::SLIM)?;
+            ok(())
+        }
+
+        "get_stream_check_config" => ok(state.db.get_stream_check_config()?),
+        "save_stream_check_config" => {
+            let config = take::<crate::services::stream_check::StreamCheckConfig>(&args, "config")?;
+            state.db.save_stream_check_config(&config)?;
+            ok(())
+        }
+        "stream_check_provider" => {
+            let app = app_type(&args, "appType")?;
+            let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
+            ok(stream_check_provider(state, app, provider_id).await?)
+        }
+        "stream_check_all_providers" => {
+            let app = app_type(&args, "appType")?;
+            let proxy_targets_only =
+                arg_bool_opt(&args, &["proxyTargetsOnly", "proxy_targets_only"])?.unwrap_or(false);
+            ok(stream_check_all_providers(state, app, proxy_targets_only).await?)
+        }
 
         "get_prompts" => {
             let app = app_type(&args, "app")?;
@@ -1018,6 +1418,88 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
                 .to_string(),
         )),
 
+        "list_daily_memory_files" => ok(list_daily_memory_files()?),
+        "read_daily_memory_file" => {
+            let filename = arg_string(&args, &["filename"])?;
+            ok(read_daily_memory_file(filename)?)
+        }
+        "write_daily_memory_file" => {
+            let filename = arg_string(&args, &["filename"])?;
+            let content = arg_string(&args, &["content"])?;
+            write_daily_memory_file(filename, content)?;
+            ok(())
+        }
+        "search_daily_memory_files" => {
+            let query = arg_string(&args, &["query"])?;
+            ok(search_daily_memory_files(query)?)
+        }
+        "delete_daily_memory_file" => {
+            let filename = arg_string(&args, &["filename"])?;
+            delete_daily_memory_file(filename)?;
+            ok(())
+        }
+        "read_workspace_file" => {
+            let filename = arg_string(&args, &["filename"])?;
+            ok(read_workspace_file(filename)?)
+        }
+        "write_workspace_file" => {
+            let filename = arg_string(&args, &["filename"])?;
+            let content = arg_string(&args, &["content"])?;
+            write_workspace_file(filename, content)?;
+            ok(())
+        }
+        "open_workspace_directory" => ok(false),
+
+        "parse_deeplink" => {
+            let url = arg_string(&args, &["url"])?;
+            ok(crate::deeplink::parse_deeplink_url(&url)?)
+        }
+        "merge_deeplink_config" => {
+            let request = take::<crate::deeplink::DeepLinkImportRequest>(&args, "request")?;
+            ok(crate::deeplink::parse_and_merge_config(&request)?)
+        }
+        "import_from_deeplink_unified" => {
+            let request = take::<crate::deeplink::DeepLinkImportRequest>(&args, "request")?;
+            ok(import_from_deeplink_unified(state, request)?)
+        }
+        "import_from_deeplink" => {
+            let request = take::<crate::deeplink::DeepLinkImportRequest>(&args, "request")?;
+            ok(crate::deeplink::import_provider_from_deeplink(state, request)?)
+        }
+
+        "get_tool_versions" => {
+            let tools = args
+                .get("tools")
+                .cloned()
+                .map(serde_json::from_value::<Vec<String>>)
+                .transpose()
+                .map_err(|e| AppError::Config(e.to_string()))?;
+            let _wsl_shell_by_tool = args
+                .get("wslShellByTool")
+                .or_else(|| args.get("wsl_shell_by_tool"))
+                .cloned()
+                .map(serde_json::from_value::<HashMap<String, WslShellPreferenceInput>>)
+                .transpose()
+                .map_err(|e| AppError::Config(e.to_string()))?;
+            ok(get_tool_versions(tools).await?)
+        }
+        "probe_tool_installations" => {
+            let tools = args
+                .get("tools")
+                .cloned()
+                .map(serde_json::from_value::<Vec<String>>)
+                .transpose()
+                .map_err(|e| AppError::Config(e.to_string()))?;
+            ok(get_tool_versions(tools).await?)
+        }
+        "run_tool_lifecycle_action" => Err(AppError::Config(
+            "tool install/update actions are not available in web mode; run the installer command manually"
+                .to_string(),
+        )),
+        "open_provider_terminal" => Err(AppError::Config(
+            "opening a native provider terminal is not available in web mode".to_string(),
+        )),
+
         "check_env_conflicts" => {
             let app = arg_string(&args, &["app"])?;
             ok(
@@ -1041,6 +1523,32 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
         "copy_text_to_clipboard" => ok(false),
         "update_tray_menu" | "set_window_theme" => ok(false),
         "open_config_folder" | "open_app_config_folder" | "open_external" => ok(false),
+        "auth_start_login"
+        | "auth_poll_for_account"
+        | "auth_list_accounts"
+        | "auth_get_status"
+        | "auth_remove_account"
+        | "auth_set_default_account"
+        | "auth_logout"
+        | "copilot_start_device_flow"
+        | "copilot_poll_for_auth"
+        | "copilot_poll_for_account"
+        | "copilot_list_accounts"
+        | "copilot_remove_account"
+        | "copilot_set_default_account"
+        | "copilot_get_auth_status"
+        | "copilot_logout"
+        | "copilot_is_authenticated"
+        | "copilot_get_token"
+        | "copilot_get_token_for_account"
+        | "copilot_get_models"
+        | "copilot_get_models_for_account"
+        | "copilot_get_usage"
+        | "copilot_get_usage_for_account"
+        | "get_codex_oauth_quota"
+        | "get_codex_oauth_models" => Err(AppError::Config(
+            "managed OAuth/Copilot account flows are not available in web mode yet".to_string(),
+        )),
 
         other => Err(AppError::Config(format!(
             "command `{other}` is not available in web mode yet"
@@ -1303,6 +1811,575 @@ fn merge_session_sync_result(
     target.errors.extend(source.errors);
 }
 
+async fn export_config_to_file(state: &AppState, file_path: String) -> Result<Value, AppError> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let target_path = PathBuf::from(&file_path);
+        db.export_sql(&target_path)?;
+        Ok::<_, AppError>(json!({
+            "success": true,
+            "message": "SQL exported successfully",
+            "filePath": file_path
+        }))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("export task failed: {e}")))?
+}
+
+async fn import_config_from_file(state: &AppState, file_path: String) -> Result<Value, AppError> {
+    let db = state.db.clone();
+    let db_for_sync = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let backup_id = db.import_sql(&PathBuf::from(&file_path))?;
+        let warning = post_import_sync_warning(db_for_sync);
+        Ok::<_, AppError>(success_payload_with_warning(backup_id, warning))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("import task failed: {e}")))?
+}
+
+async fn sync_current_providers_live(state: &AppState) -> Result<Value, AppError> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let app_state = AppState::new(db);
+        ProviderService::sync_current_to_live(&app_state)?;
+        Ok::<_, AppError>(json!({
+            "success": true,
+            "message": "Live configuration synchronized"
+        }))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("sync task failed: {e}")))?
+}
+
+async fn create_db_backup(state: &AppState) -> Result<String, AppError> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.backup_database_file()?
+            .and_then(|path| path.file_name().map(|f| f.to_string_lossy().into_owned()))
+            .ok_or_else(|| AppError::Config("Database file not found, backup skipped".to_string()))
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("backup task failed: {e}")))?
+}
+
+async fn restore_db_backup(state: &AppState, filename: String) -> Result<String, AppError> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.restore_from_backup(&filename))
+        .await
+        .map_err(|e| AppError::Config(format!("restore task failed: {e}")))?
+}
+
+fn success_payload_with_warning(backup_id: String, warning: Option<String>) -> Value {
+    let mut value = json!({
+        "success": true,
+        "message": "Configuration imported successfully",
+        "backupId": backup_id
+    });
+    if let Some(warning) = warning {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("warning".to_string(), Value::String(warning));
+        }
+    }
+    value
+}
+
+fn post_import_sync_warning(db: Arc<Database>) -> Option<String> {
+    let app_state = AppState::new(db);
+    ProviderService::sync_current_to_live(&app_state)
+        .err()
+        .map(|e| e.to_string())
+}
+
+fn webdav_not_configured() -> AppError {
+    AppError::localized(
+        "webdav.sync.not_configured",
+        "未配置 WebDAV 同步",
+        "WebDAV sync is not configured.",
+    )
+}
+
+fn webdav_sync_disabled() -> AppError {
+    AppError::localized(
+        "webdav.sync.disabled",
+        "WebDAV 同步未启用",
+        "WebDAV sync is disabled.",
+    )
+}
+
+fn require_enabled_webdav_settings() -> Result<crate::settings::WebDavSyncSettings, AppError> {
+    let settings = crate::settings::get_webdav_sync_settings().ok_or_else(webdav_not_configured)?;
+    if !settings.enabled {
+        return Err(webdav_sync_disabled());
+    }
+    Ok(settings)
+}
+
+fn resolve_webdav_password(
+    mut incoming: crate::settings::WebDavSyncSettings,
+    preserve_empty_password: bool,
+) -> crate::settings::WebDavSyncSettings {
+    if preserve_empty_password && incoming.password.is_empty() {
+        if let Some(existing) = crate::settings::get_webdav_sync_settings() {
+            incoming.password = existing.password;
+        }
+    }
+    incoming
+}
+
+async fn webdav_test_connection(
+    settings: crate::settings::WebDavSyncSettings,
+    preserve_empty_password: bool,
+) -> Result<Value, AppError> {
+    let settings = resolve_webdav_password(settings, preserve_empty_password);
+    crate::services::webdav_sync::check_connection(&settings).await?;
+    Ok(json!({ "success": true, "message": "WebDAV connection ok" }))
+}
+
+fn webdav_sync_save_settings(
+    settings: crate::settings::WebDavSyncSettings,
+    password_touched: bool,
+) -> Result<Value, AppError> {
+    let existing = crate::settings::get_webdav_sync_settings();
+    let mut settings = if !password_touched && settings.password.is_empty() {
+        if let Some(existing_settings) = existing.clone() {
+            crate::settings::WebDavSyncSettings {
+                password: existing_settings.password,
+                ..settings
+            }
+        } else {
+            settings
+        }
+    } else {
+        settings
+    };
+    if let Some(existing_settings) = existing {
+        settings.status = existing_settings.status;
+    }
+    settings.normalize();
+    settings.validate()?;
+    crate::settings::set_webdav_sync_settings(Some(settings))?;
+    Ok(json!({ "success": true }))
+}
+
+async fn webdav_sync_upload(state: &AppState) -> Result<Value, AppError> {
+    let db = state.db.clone();
+    let mut settings = require_enabled_webdav_settings()?;
+    let result = crate::services::webdav_sync::run_with_sync_lock(
+        crate::services::webdav_sync::upload(&db, &mut settings),
+    )
+    .await;
+    persist_webdav_error(&mut settings, &result);
+    result
+}
+
+async fn webdav_sync_download(state: &AppState) -> Result<Value, AppError> {
+    let db = state.db.clone();
+    let db_for_sync = db.clone();
+    let mut settings = require_enabled_webdav_settings()?;
+    let result = crate::services::webdav_sync::run_with_sync_lock(
+        crate::services::webdav_sync::download(&db, &mut settings),
+    )
+    .await;
+    persist_webdav_error(&mut settings, &result);
+    let mut value = result?;
+    if let Some(warning) = post_import_sync_warning(db_for_sync) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("warning".to_string(), Value::String(warning));
+        }
+    }
+    Ok(value)
+}
+
+async fn webdav_sync_fetch_remote_info() -> Result<Value, AppError> {
+    let settings = require_enabled_webdav_settings()?;
+    Ok(crate::services::webdav_sync::fetch_remote_info(&settings)
+        .await?
+        .unwrap_or(json!({ "empty": true })))
+}
+
+fn persist_webdav_error(
+    settings: &mut crate::settings::WebDavSyncSettings,
+    result: &Result<Value, AppError>,
+) {
+    if let Err(error) = result {
+        settings.status.last_error = Some(error.to_string());
+        settings.status.last_error_source = Some("manual".to_string());
+        let _ = crate::settings::update_webdav_sync_status(settings.status.clone());
+    }
+}
+
+fn s3_not_configured() -> AppError {
+    AppError::localized(
+        "s3.sync.not_configured",
+        "未配置 S3 同步",
+        "S3 sync is not configured.",
+    )
+}
+
+fn s3_sync_disabled() -> AppError {
+    AppError::localized("s3.sync.disabled", "S3 同步未启用", "S3 sync is disabled.")
+}
+
+fn require_enabled_s3_settings() -> Result<crate::settings::S3SyncSettings, AppError> {
+    let settings = crate::settings::get_s3_sync_settings().ok_or_else(s3_not_configured)?;
+    if !settings.enabled {
+        return Err(s3_sync_disabled());
+    }
+    Ok(settings)
+}
+
+fn resolve_s3_secret(
+    mut incoming: crate::settings::S3SyncSettings,
+    preserve_empty_secret: bool,
+) -> crate::settings::S3SyncSettings {
+    if preserve_empty_secret && incoming.secret_access_key.is_empty() {
+        if let Some(existing) = crate::settings::get_s3_sync_settings() {
+            incoming.secret_access_key = existing.secret_access_key;
+        }
+    }
+    incoming
+}
+
+async fn s3_test_connection(
+    settings: crate::settings::S3SyncSettings,
+    preserve_empty_secret: bool,
+) -> Result<Value, AppError> {
+    let settings = resolve_s3_secret(settings, preserve_empty_secret);
+    crate::services::s3_sync::check_connection(&settings).await?;
+    Ok(json!({ "success": true, "message": "S3 connection ok" }))
+}
+
+fn s3_sync_save_settings(
+    settings: crate::settings::S3SyncSettings,
+    password_touched: bool,
+) -> Result<Value, AppError> {
+    let existing = crate::settings::get_s3_sync_settings();
+    let mut settings = if !password_touched && settings.secret_access_key.is_empty() {
+        if let Some(existing_settings) = existing.clone() {
+            crate::settings::S3SyncSettings {
+                secret_access_key: existing_settings.secret_access_key,
+                ..settings
+            }
+        } else {
+            settings
+        }
+    } else {
+        settings
+    };
+    if let Some(existing_settings) = existing {
+        settings.status = existing_settings.status;
+    }
+    settings.normalize();
+    settings.validate()?;
+    crate::settings::set_s3_sync_settings(Some(settings))?;
+    Ok(json!({ "success": true }))
+}
+
+async fn s3_sync_upload(state: &AppState) -> Result<Value, AppError> {
+    let db = state.db.clone();
+    let mut settings = require_enabled_s3_settings()?;
+    let result = crate::services::s3_sync::run_with_sync_lock(crate::services::s3_sync::upload(
+        &db,
+        &mut settings,
+    ))
+    .await;
+    persist_s3_error(&mut settings, &result);
+    result
+}
+
+async fn s3_sync_download(state: &AppState) -> Result<Value, AppError> {
+    let db = state.db.clone();
+    let db_for_sync = db.clone();
+    let mut settings = require_enabled_s3_settings()?;
+    let result = crate::services::s3_sync::run_with_sync_lock(crate::services::s3_sync::download(
+        &db,
+        &mut settings,
+    ))
+    .await;
+    persist_s3_error(&mut settings, &result);
+    let mut value = result?;
+    if let Some(warning) = post_import_sync_warning(db_for_sync) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("warning".to_string(), Value::String(warning));
+        }
+    }
+    Ok(value)
+}
+
+async fn s3_sync_fetch_remote_info() -> Result<Value, AppError> {
+    let settings = require_enabled_s3_settings()?;
+    Ok(crate::services::s3_sync::fetch_remote_info(&settings)
+        .await?
+        .unwrap_or(json!({ "empty": true })))
+}
+
+fn persist_s3_error(
+    settings: &mut crate::settings::S3SyncSettings,
+    result: &Result<Value, AppError>,
+) {
+    if let Err(error) = result {
+        settings.status.last_error = Some(error.to_string());
+        settings.status.last_error_source = Some("manual".to_string());
+        let _ = crate::settings::update_s3_sync_status(settings.status.clone());
+    }
+}
+
+async fn restore_codex_unified_history() -> Result<Value, AppError> {
+    let outcome = tokio::task::spawn_blocking(|| {
+        crate::codex_history_migration::restore_codex_official_history_from_backups()
+    })
+    .await
+    .map_err(|e| AppError::Config(format!("restore history task failed: {e}")))??;
+    Ok(json!({
+        "restoredJsonlFiles": outcome.restored_jsonl_files,
+        "restoredStateRows": outcome.restored_state_rows,
+        "skippedReason": outcome.skipped_reason,
+    }))
+}
+
+async fn set_auto_failover_enabled_web(
+    state: &AppState,
+    app_type: String,
+    enabled: bool,
+) -> Result<(), AppError> {
+    let mut config = state.db.get_proxy_config_for_app(&app_type).await?;
+    if enabled && !config.enabled {
+        return Err(AppError::Config(
+            "需要先启用该应用的代理接管，再开启故障转移".to_string(),
+        ));
+    }
+
+    let mut auto_added_provider_id: Option<String> = None;
+    let p1_provider_id = if enabled {
+        let mut queue = state.db.get_failover_queue(&app_type)?;
+        if queue.is_empty() {
+            let app_enum =
+                AppType::from_str(&app_type).map_err(|e| AppError::Config(e.to_string()))?;
+            let current_id = crate::settings::get_effective_current_provider(&state.db, &app_enum)?;
+            let Some(current_id) = current_id else {
+                return Err(AppError::Config(
+                    "故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string(),
+                ));
+            };
+            state.db.add_to_failover_queue(&app_type, &current_id)?;
+            auto_added_provider_id = Some(current_id);
+            queue = state.db.get_failover_queue(&app_type)?;
+        }
+        queue
+            .first()
+            .map(|item| item.provider_id.clone())
+            .ok_or_else(|| AppError::Config("故障转移队列为空，无法开启故障转移".to_string()))?
+    } else {
+        String::new()
+    };
+
+    if enabled {
+        if let Err(error) = state
+            .proxy_service
+            .switch_proxy_target(&app_type, &p1_provider_id)
+            .await
+        {
+            if let Some(provider_id) = auto_added_provider_id {
+                let _ = state.db.remove_from_failover_queue(&app_type, &provider_id);
+            }
+            return Err(AppError::Config(error));
+        }
+    }
+
+    config.auto_failover_enabled = enabled;
+    state.db.update_proxy_config_for_app(config).await?;
+    Ok(())
+}
+
+async fn test_proxy_url(url: String) -> Result<ProxyTestResult, AppError> {
+    let start = std::time::Instant::now();
+    let proxy = reqwest::Proxy::all(&url).map_err(|e| AppError::Config(e.to_string()))?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| AppError::Config(e.to_string()))?;
+
+    for target in [
+        "https://httpbin.org/get",
+        "https://www.google.com",
+        "https://api.anthropic.com",
+    ] {
+        match client.head(target).send().await {
+            Ok(response)
+                if response.status().is_success() || response.status().is_redirection() =>
+            {
+                return Ok(ProxyTestResult {
+                    success: true,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    error: None,
+                });
+            }
+            Ok(response) => {
+                return Ok(ProxyTestResult {
+                    success: false,
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    error: Some(format!("HTTP {}", response.status())),
+                });
+            }
+            Err(error) => {
+                if target == "https://api.anthropic.com" {
+                    return Ok(ProxyTestResult {
+                        success: false,
+                        latency_ms: start.elapsed().as_millis() as u64,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(ProxyTestResult {
+        success: false,
+        latency_ms: start.elapsed().as_millis() as u64,
+        error: Some("proxy test failed".to_string()),
+    })
+}
+
+fn scan_local_proxies() -> Vec<DetectedProxy> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr as StdSocketAddr, TcpStream};
+
+    let ports = [
+        (7890, "http", "mixed"),
+        (7891, "socks5", "socks5"),
+        (1080, "socks5", "socks5"),
+        (8080, "http", "http"),
+        (8888, "http", "http"),
+        (3128, "http", "http"),
+        (10808, "socks5", "socks5"),
+        (10809, "http", "http"),
+    ];
+    let mut detected = Vec::new();
+    for (port, scheme, proxy_type) in ports {
+        let addr = StdSocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+            detected.push(DetectedProxy {
+                url: format!("{scheme}://127.0.0.1:{port}"),
+                proxy_type: proxy_type.to_string(),
+                port,
+            });
+        }
+    }
+    detected
+}
+
+async fn probe_hermes_web_ui(path: Option<String>) -> Result<String, AppError> {
+    let port = std::env::var("HERMES_WEB_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .unwrap_or(9119);
+    let base = format!("http://127.0.0.1:{port}");
+    let probe_url = format!("{base}/api/status");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(1200))
+        .no_proxy()
+        .build()
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    client
+        .get(&probe_url)
+        .send()
+        .await
+        .map_err(|_| AppError::Config("hermes_web_offline".to_string()))?;
+    Ok(match path.as_deref() {
+        Some(p) if p.starts_with('/') => format!("{base}{p}"),
+        Some(p) if !p.is_empty() => format!("{base}/{p}"),
+        _ => format!("{base}/"),
+    })
+}
+
+fn disable_omo_variant(
+    state: &AppState,
+    category: &str,
+    variant: &crate::services::omo::OmoVariant,
+) -> Result<(), AppError> {
+    let providers = state.db.get_all_providers("opencode")?;
+    for (id, provider) in providers {
+        if provider.category.as_deref() == Some(category) {
+            state
+                .db
+                .clear_omo_provider_current("opencode", &id, category)?;
+        }
+    }
+    OmoService::delete_config_file(variant)?;
+    Ok(())
+}
+
+async fn stream_check_provider(
+    state: &AppState,
+    app: AppType,
+    provider_id: String,
+) -> Result<crate::services::stream_check::StreamCheckResult, AppError> {
+    let config = state.db.get_stream_check_config()?;
+    let providers = state.db.get_all_providers(app.as_str())?;
+    let provider = providers
+        .get(&provider_id)
+        .ok_or_else(|| AppError::Message(format!("供应商 {provider_id} 不存在")))?;
+    let result = crate::services::stream_check::StreamCheckService::check_with_retry(
+        &app, provider, &config, None,
+    )
+    .await?;
+    let _ = state
+        .db
+        .save_stream_check_log(&provider_id, &provider.name, app.as_str(), &result);
+    Ok(result)
+}
+
+async fn stream_check_all_providers(
+    state: &AppState,
+    app: AppType,
+    proxy_targets_only: bool,
+) -> Result<Vec<(String, crate::services::stream_check::StreamCheckResult)>, AppError> {
+    let config = state.db.get_stream_check_config()?;
+    let providers = state.db.get_all_providers(app.as_str())?;
+    let allowed_ids = if proxy_targets_only {
+        let mut ids = std::collections::HashSet::new();
+        if let Ok(Some(current_id)) = state.db.get_current_provider(app.as_str()) {
+            ids.insert(current_id);
+        }
+        if let Ok(queue) = state.db.get_failover_queue(app.as_str()) {
+            for item in queue {
+                ids.insert(item.provider_id);
+            }
+        }
+        Some(ids)
+    } else {
+        None
+    };
+
+    let mut results = Vec::new();
+    for (id, provider) in providers {
+        if allowed_ids.as_ref().is_some_and(|ids| !ids.contains(&id)) {
+            continue;
+        }
+        let result = crate::services::stream_check::StreamCheckService::check_with_retry(
+            &app, &provider, &config, None,
+        )
+        .await
+        .unwrap_or_else(|e| crate::services::stream_check::StreamCheckResult {
+            status: crate::services::stream_check::HealthStatus::Failed,
+            success: false,
+            message: e.to_string(),
+            response_time_ms: None,
+            http_status: None,
+            model_used: String::new(),
+            tested_at: chrono::Utc::now().timestamp(),
+            retry_count: 0,
+            error_category: None,
+        });
+        let _ = state
+            .db
+            .save_stream_check_log(&id, &provider.name, app.as_str(), &result);
+        results.push((id, result));
+    }
+    Ok(results)
+}
+
 fn get_config_dir(app: String) -> Result<String, AppError> {
     let dir = match AppType::from_str(&app).map_err(|e| AppError::Config(e.to_string()))? {
         AppType::Claude => crate::config::get_claude_config_dir(),
@@ -1315,6 +2392,347 @@ fn get_config_dir(app: String) -> Result<String, AppError> {
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
     };
     Ok(dir.to_string_lossy().to_string())
+}
+
+const WORKSPACE_ALLOWED_FILES: &[&str] = &[
+    "AGENTS.md",
+    "SOUL.md",
+    "USER.md",
+    "IDENTITY.md",
+    "TOOLS.md",
+    "MEMORY.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "BOOT.md",
+];
+
+fn validate_workspace_filename(filename: &str) -> Result<(), AppError> {
+    if WORKSPACE_ALLOWED_FILES.contains(&filename) {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "Invalid workspace filename: {filename}. Allowed: {}",
+            WORKSPACE_ALLOWED_FILES.join(", ")
+        )))
+    }
+}
+
+fn validate_daily_memory_filename(filename: &str) -> Result<(), AppError> {
+    let bytes = filename.as_bytes();
+    let valid = bytes.len() == 13
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && filename.ends_with(".md")
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit);
+    if valid {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "Invalid daily memory filename: {filename}. Expected: YYYY-MM-DD.md"
+        )))
+    }
+}
+
+fn openclaw_workspace_dir() -> PathBuf {
+    crate::openclaw_config::get_openclaw_dir().join("workspace")
+}
+
+fn openclaw_memory_dir() -> PathBuf {
+    openclaw_workspace_dir().join("memory")
+}
+
+fn list_daily_memory_files() -> Result<Vec<DailyMemoryFileInfo>, AppError> {
+    let memory_dir = openclaw_memory_dir();
+    if !memory_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(&memory_dir).map_err(|e| AppError::io(&memory_dir, e))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if validate_daily_memory_filename(&name).is_err() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified_at = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let preview = std::fs::read_to_string(entry.path())
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        files.push(DailyMemoryFileInfo {
+            date: name.trim_end_matches(".md").to_string(),
+            filename: name,
+            size_bytes: meta.len(),
+            modified_at,
+            preview,
+        });
+    }
+    files.sort_by(|a, b| b.filename.cmp(&a.filename));
+    Ok(files)
+}
+
+fn read_daily_memory_file(filename: String) -> Result<Option<String>, AppError> {
+    validate_daily_memory_filename(&filename)?;
+    read_optional_text(openclaw_memory_dir().join(filename))
+}
+
+fn write_daily_memory_file(filename: String, content: String) -> Result<(), AppError> {
+    validate_daily_memory_filename(&filename)?;
+    let dir = openclaw_memory_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| AppError::io(&dir, e))?;
+    crate::config::write_text_file(&dir.join(filename), &content)
+}
+
+fn search_daily_memory_files(query: String) -> Result<Vec<DailyMemorySearchResult>, AppError> {
+    let memory_dir = openclaw_memory_dir();
+    if !memory_dir.exists() || query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query_lower = query.to_lowercase();
+    let mut results = Vec::new();
+    let entries = std::fs::read_dir(&memory_dir).map_err(|e| AppError::io(&memory_dir, e))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if validate_daily_memory_filename(&name).is_err() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        let content_lower = content.to_lowercase();
+        let date = name.trim_end_matches(".md").to_string();
+        let matches: Vec<usize> = content_lower
+            .match_indices(&query_lower)
+            .map(|(i, _)| i)
+            .collect();
+        if matches.is_empty() && !date.to_lowercase().contains(&query_lower) {
+            continue;
+        }
+        let snippet = if let Some(first) = matches.first().copied() {
+            let start = floor_char_boundary(&content, first.saturating_sub(50));
+            let end = ceil_char_boundary(&content, (first + 70).min(content.len()));
+            format!(
+                "{}{}{}",
+                if start > 0 { "..." } else { "" },
+                &content[start..end],
+                if end < content.len() { "..." } else { "" }
+            )
+        } else {
+            let end = ceil_char_boundary(&content, 120.min(content.len()));
+            format!(
+                "{}{}",
+                &content[..end],
+                if end < content.len() { "..." } else { "" }
+            )
+        };
+        let modified_at = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        results.push(DailyMemorySearchResult {
+            filename: name,
+            date,
+            size_bytes: meta.len(),
+            modified_at,
+            snippet,
+            match_count: matches.len(),
+        });
+    }
+    results.sort_by(|a, b| b.filename.cmp(&a.filename));
+    Ok(results)
+}
+
+fn delete_daily_memory_file(filename: String) -> Result<(), AppError> {
+    validate_daily_memory_filename(&filename)?;
+    let path = openclaw_memory_dir().join(filename);
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| AppError::io(&path, e))?;
+    }
+    Ok(())
+}
+
+fn read_workspace_file(filename: String) -> Result<Option<String>, AppError> {
+    validate_workspace_filename(&filename)?;
+    read_optional_text(openclaw_workspace_dir().join(filename))
+}
+
+fn write_workspace_file(filename: String, content: String) -> Result<(), AppError> {
+    validate_workspace_filename(&filename)?;
+    let dir = openclaw_workspace_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| AppError::io(&dir, e))?;
+    crate::config::write_text_file(&dir.join(filename), &content)
+}
+
+fn read_optional_text(path: PathBuf) -> Result<Option<String>, AppError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| AppError::io(&path, e))
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+fn import_from_deeplink_unified(
+    state: &AppState,
+    request: crate::deeplink::DeepLinkImportRequest,
+) -> Result<Value, AppError> {
+    match request.resource.as_str() {
+        "provider" => {
+            let id = crate::deeplink::import_provider_from_deeplink(state, request)?;
+            Ok(json!({ "type": "provider", "id": id }))
+        }
+        "prompt" => {
+            let id = crate::deeplink::import_prompt_from_deeplink(state, request)?;
+            Ok(json!({ "type": "prompt", "id": id }))
+        }
+        "mcp" => {
+            let result = crate::deeplink::import_mcp_from_deeplink(state, request)?;
+            Ok(json!({
+                "type": "mcp",
+                "importedCount": result.imported_count,
+                "importedIds": result.imported_ids,
+                "failed": result.failed
+            }))
+        }
+        "skill" => {
+            let key = crate::deeplink::import_skill_from_deeplink(state, request)?;
+            Ok(json!({ "type": "skill", "key": key }))
+        }
+        other => Err(AppError::Config(format!(
+            "Unsupported resource type: {other}"
+        ))),
+    }
+}
+
+async fn get_tool_versions(tools: Option<Vec<String>>) -> Result<Vec<ToolVersion>, AppError> {
+    const VALID_TOOLS: &[&str] = &[
+        "claude", "codex", "gemini", "opencode", "openclaw", "hermes",
+    ];
+    let requested: Vec<&str> = if let Some(tools) = tools.as_ref() {
+        VALID_TOOLS
+            .iter()
+            .copied()
+            .filter(|tool| tools.iter().any(|requested| requested == tool))
+            .collect()
+    } else {
+        VALID_TOOLS.to_vec()
+    };
+
+    let mut versions = Vec::new();
+    for tool in requested {
+        versions.push(
+            tokio::task::spawn_blocking(move || get_single_tool_version(tool))
+                .await
+                .map_err(|e| AppError::Config(format!("tool version task failed: {e}")))?,
+        );
+    }
+    Ok(versions)
+}
+
+fn get_single_tool_version(tool: &str) -> ToolVersion {
+    let output = std::process::Command::new(tool).arg("--version").output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let fallback = String::from_utf8_lossy(&output.stderr);
+            ToolVersion {
+                name: tool.to_string(),
+                version: first_non_empty_line(&text)
+                    .or_else(|| first_non_empty_line(&fallback))
+                    .map(str::to_string),
+                latest_version: None,
+                error: None,
+                installed_but_broken: false,
+                env_type: tool_env_type(),
+                wsl_distro: None,
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            ToolVersion {
+                name: tool.to_string(),
+                version: None,
+                latest_version: None,
+                error: Some(if stderr.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    stderr.trim().to_string()
+                }),
+                installed_but_broken: true,
+                env_type: tool_env_type(),
+                wsl_distro: None,
+            }
+        }
+        Err(error) => ToolVersion {
+            name: tool.to_string(),
+            version: None,
+            latest_version: None,
+            error: Some(error.to_string()),
+            installed_but_broken: false,
+            env_type: tool_env_type(),
+            wsl_distro: None,
+        },
+    }
+}
+
+fn first_non_empty_line(text: &str) -> Option<&str> {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+}
+
+fn tool_env_type() -> String {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    }
+    .to_string()
 }
 
 fn is_portable_mode() -> bool {

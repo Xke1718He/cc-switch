@@ -25,6 +25,14 @@ Install the generated package:
 sudo apt install ./src-tauri/target/packages/cc-switch-web_*_*.deb
 ```
 
+If you reinstall the same version, restart the running daemon so the browser UI
+talks to the newly installed binary:
+
+```shell
+sudo apt install --reinstall ./src-tauri/target/packages/cc-switch-web_*_*.deb
+systemctl --user restart cc-switch-web
+```
+
 Start CC Switch Web:
 
 ```shell
@@ -57,11 +65,36 @@ systemctl --user enable --now cc-switch-web.service
 cc-switch-web open
 ```
 
+For long-running use, the systemd user service is preferred because it keeps the
+daemon alive after package upgrades and gives clear status/log commands:
+
+```shell
+systemctl --user status cc-switch-web --no-pager
+journalctl --user -u cc-switch-web -n 100 --no-pager
+```
+
+Current Web mode coverage:
+
+- Core provider management, proxy control, failover queue, MCP, prompts, skills,
+  sessions, profiles, usage statistics, and live config sync are supported.
+- P1 Web support includes SQL import/export, local database backups, WebDAV/S3
+  sync, local proxy detection, global proxy testing, circuit breaker config, and
+  auto-failover controls.
+- P2 Web support includes OpenClaw/Hermes/OMO configuration, workspace and daily
+  memory files, stream reachability checks, model fetching, subscription/quota
+  queries, balance checks, optimizer/rectifier/log settings, deeplink import,
+  and tool version detection.
+- P3/native desktop actions are intentionally degraded in Web mode. Managed
+  OAuth/Copilot login flows, native file pickers, opening terminals/folders,
+  tray/window controls, auto-launch, app updater, and Claude plugin config are
+  not available from the headless daemon. When a file path is needed, provide it
+  explicitly instead of relying on a native dialog.
+
 Notes:
 
 - The Web package command is `cc-switch-web`, not `cc-switch`, to avoid conflicts with the native desktop app.
 - The daemon intentionally runs as the current user so it can read and write the user's Claude Code, Codex, Gemini, OpenCode, OpenClaw, Hermes, and CC Switch configuration files.
-- Native desktop-only features such as tray menus, file dialogs, window controls, deep-link events, and automatic app restart are degraded or unavailable in Web mode.
+- Default Web URL: `http://127.0.0.1:31235`.
 
 <div align="center">
 
