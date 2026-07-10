@@ -1,7 +1,7 @@
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::services::{ProviderService, SpeedtestService};
+use crate::services::{ProviderService, SkillService, SpeedtestService};
 use crate::store::AppState;
 use axum::{
     extract::{Path, State},
@@ -515,6 +515,191 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
                 .map_err(|e| AppError::Config(e.to_string()))?;
             ok(())
         }
+
+        "get_installed_skills" => ok(SkillService::get_all_installed(&state.db)
+            .map_err(|e| AppError::Config(e.to_string()))?),
+        "get_skill_backups" => {
+            ok(SkillService::list_backups().map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "delete_skill_backup" => {
+            let backup_id = arg_string(&args, &["backupId", "backup_id"])?;
+            SkillService::delete_backup(&backup_id).map_err(|e| AppError::Config(e.to_string()))?;
+            ok(true)
+        }
+        "install_skill_unified" => {
+            let skill = take::<crate::services::skill::DiscoverableSkill>(&args, "skill")?;
+            let current_app = app_type_from_string(arg_string(&args, &["currentApp", "current_app"])?)?;
+            ok(SkillService::new()
+                .install(&state.db, &skill, &current_app)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "uninstall_skill_unified" => {
+            let id = arg_string(&args, &["id"])?;
+            ok(SkillService::uninstall(&state.db, &id)
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "restore_skill_backup" => {
+            let backup_id = arg_string(&args, &["backupId", "backup_id"])?;
+            let current_app = app_type_from_string(arg_string(&args, &["currentApp", "current_app"])?)?;
+            ok(SkillService::restore_from_backup(
+                &state.db,
+                &backup_id,
+                &current_app,
+            )
+            .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "toggle_skill_app" => {
+            let id = arg_string(&args, &["id"])?;
+            let app = app_type_from_string(arg_string(&args, &["app"])?)?;
+            let enabled = arg_bool(&args, &["enabled"])?;
+            SkillService::toggle_app(&state.db, &id, &app, enabled)
+                .map_err(|e| AppError::Config(e.to_string()))?;
+            ok(true)
+        }
+        "scan_unmanaged_skills" => ok(SkillService::scan_unmanaged(&state.db)
+            .map_err(|e| AppError::Config(e.to_string()))?),
+        "import_skills_from_apps" => {
+            let imports =
+                take::<Vec<crate::services::skill::ImportSkillSelection>>(&args, "imports")?;
+            ok(SkillService::import_from_apps(&state.db, imports)
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "discover_available_skills" => {
+            let repos = state.db.get_skill_repos()?;
+            ok(SkillService::new()
+                .discover_available(repos)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "check_skill_updates" => ok(SkillService::new()
+            .check_updates(&state.db)
+            .await
+            .map_err(|e| AppError::Config(e.to_string()))?),
+        "update_skill" => {
+            let id = arg_string(&args, &["id"])?;
+            ok(SkillService::new()
+                .update_skill(&state.db, &id)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "migrate_skill_storage" => {
+            let target =
+                take::<crate::services::skill::SkillStorageLocation>(&args, "target")?;
+            ok(SkillService::migrate_storage(&state.db, target)
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "search_skills_sh" => {
+            let query = arg_string(&args, &["query"])?;
+            let limit = arg_u64_opt(&args, &["limit"])?.unwrap_or(20) as usize;
+            let offset = arg_u64_opt(&args, &["offset"])?.unwrap_or(0) as usize;
+            ok(SkillService::search_skills_sh(&query, limit, offset)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "get_skills" => {
+            let repos = state.db.get_skill_repos()?;
+            ok(SkillService::new()
+                .list_skills(repos, &state.db)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "get_skills_for_app" => {
+            let _ = app_type(&args, "app")?;
+            let repos = state.db.get_skill_repos()?;
+            ok(SkillService::new()
+                .list_skills(repos, &state.db)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "install_skill" => {
+            let directory = arg_string(&args, &["directory"])?;
+            install_skill_for_app(state, AppType::Claude, directory).await?;
+            ok(true)
+        }
+        "install_skill_for_app" => {
+            let app = app_type(&args, "app")?;
+            let directory = arg_string(&args, &["directory"])?;
+            install_skill_for_app(state, app, directory).await?;
+            ok(true)
+        }
+        "uninstall_skill" => {
+            let directory = arg_string(&args, &["directory"])?;
+            ok(uninstall_skill_by_directory(
+                state,
+                AppType::Claude,
+                directory,
+            )?)
+        }
+        "uninstall_skill_for_app" => {
+            let app = app_type(&args, "app")?;
+            let directory = arg_string(&args, &["directory"])?;
+            ok(uninstall_skill_by_directory(state, app, directory)?)
+        }
+        "get_skill_repos" => ok(state.db.get_skill_repos()?),
+        "add_skill_repo" => {
+            let repo = take::<crate::services::skill::SkillRepo>(&args, "repo")?;
+            state.db.save_skill_repo(&repo)?;
+            ok(true)
+        }
+        "remove_skill_repo" => {
+            let owner = arg_string(&args, &["owner"])?;
+            let name = arg_string(&args, &["name"])?;
+            state.db.delete_skill_repo(&owner, &name)?;
+            ok(true)
+        }
+        "install_skills_from_zip" => {
+            let file_path = arg_string(&args, &["filePath", "file_path"])?;
+            let current_app = app_type_from_string(arg_string(&args, &["currentApp", "current_app"])?)?;
+            ok(SkillService::install_from_zip(
+                &state.db,
+                std::path::Path::new(&file_path),
+                &current_app,
+            )
+            .map_err(|e| AppError::Config(e.to_string()))?)
+        }
+        "open_zip_file_dialog" => Err(AppError::Config(
+            "ZIP file picker is not available in web mode; provide a local file path instead"
+                .to_string(),
+        )),
+
+        "list_sessions" => ok(tokio::task::spawn_blocking(crate::session_manager::scan_sessions)
+            .await
+            .map_err(|e| AppError::Config(format!("failed to scan sessions: {e}")))?),
+        "get_session_messages" => {
+            let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
+            let source_path = arg_string(&args, &["sourcePath", "source_path"])?;
+            ok(tokio::task::spawn_blocking(move || {
+                crate::session_manager::load_messages(&provider_id, &source_path)
+            })
+            .await
+            .map_err(|e| AppError::Config(format!("failed to load session messages: {e}")))?
+            .map_err(AppError::Config)?)
+        }
+        "delete_session" => {
+            let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
+            let session_id = arg_string(&args, &["sessionId", "session_id"])?;
+            let source_path = arg_string(&args, &["sourcePath", "source_path"])?;
+            ok(tokio::task::spawn_blocking(move || {
+                crate::session_manager::delete_session(&provider_id, &session_id, &source_path)
+            })
+            .await
+            .map_err(|e| AppError::Config(format!("failed to delete session: {e}")))?
+            .map_err(AppError::Config)?)
+        }
+        "delete_sessions" => {
+            let items = take::<Vec<crate::session_manager::DeleteSessionRequest>>(&args, "items")?;
+            ok(tokio::task::spawn_blocking(move || {
+                crate::session_manager::delete_sessions(&items)
+            })
+            .await
+            .map_err(|e| AppError::Config(format!("failed to delete sessions: {e}")))?)
+        }
+        "launch_session_terminal" => Err(AppError::Config(
+            "Launching a native terminal is not available in web mode; copy and run the command manually"
+                .to_string(),
+        )),
+
         "check_env_conflicts" => {
             let app = arg_string(&args, &["app"])?;
             ok(
@@ -550,7 +735,59 @@ fn ok<T: Serialize>(value: T) -> Result<Value, AppError> {
 }
 
 fn app_type(args: &Value, key: &str) -> Result<AppType, AppError> {
-    AppType::from_str(&arg_string(args, &[key])?).map_err(|e| AppError::Config(e.to_string()))
+    app_type_from_string(arg_string(args, &[key])?)
+}
+
+fn app_type_from_string(app: String) -> Result<AppType, AppError> {
+    AppType::from_str(&app).map_err(|e| AppError::Config(e.to_string()))
+}
+
+async fn install_skill_for_app(
+    state: &AppState,
+    app: AppType,
+    directory: String,
+) -> Result<(), AppError> {
+    let repos = state.db.get_skill_repos()?;
+    let skills = SkillService::new()
+        .discover_available(repos)
+        .await
+        .map_err(|e| AppError::Config(e.to_string()))?;
+
+    let skill = skills
+        .into_iter()
+        .find(|skill| {
+            let install_name = std::path::Path::new(&skill.directory)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| skill.directory.clone());
+
+            install_name.eq_ignore_ascii_case(&directory)
+                || skill.directory.eq_ignore_ascii_case(&directory)
+        })
+        .ok_or_else(|| AppError::Config(format!("Skill not found: {directory}")))?;
+
+    SkillService::new()
+        .install(&state.db, &skill, &app)
+        .await
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    Ok(())
+}
+
+fn uninstall_skill_by_directory(
+    state: &AppState,
+    app: AppType,
+    directory: String,
+) -> Result<crate::services::skill::SkillUninstallResult, AppError> {
+    let _ = app;
+    let skills =
+        SkillService::get_all_installed(&state.db).map_err(|e| AppError::Config(e.to_string()))?;
+
+    let skill = skills
+        .into_iter()
+        .find(|skill| skill.directory.eq_ignore_ascii_case(&directory))
+        .ok_or_else(|| AppError::Config(format!("Installed skill not found: {directory}")))?;
+
+    SkillService::uninstall(&state.db, &skill.id).map_err(|e| AppError::Config(e.to_string()))
 }
 
 fn get_config_dir(app: String) -> Result<String, AppError> {
