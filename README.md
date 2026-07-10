@@ -1,3 +1,68 @@
+# CC Switch Web / Headless Mode
+
+This branch adds a headless Web distribution for Linux environments where the
+Tauri/WebKitGTK desktop runtime is unavailable or unreliable, especially Ubuntu
+20.04. The Web build keeps the existing CC Switch Rust business logic, but runs
+it as a local HTTP daemon and serves the React UI in a normal browser.
+
+Key changes:
+
+- Adds `cc-switchd`, a headless daemon that listens on `127.0.0.1:31235` by default.
+- Adds browser-compatible Tauri shims so the existing React UI can run without a native WebView.
+- Splits Rust features so `--no-default-features --features headless` does not pull Tauri, GTK, GDK, or WebKitGTK runtime dependencies.
+- Adds a distributable Debian package target: `cc-switch-web`.
+- Keeps the original Tauri desktop app as the default build path.
+
+Build the Web `.deb` package:
+
+```shell
+pnpm package:web:deb
+```
+
+Install the generated package:
+
+```shell
+sudo apt install ./src-tauri/target/packages/cc-switch-web_*_*.deb
+```
+
+Start CC Switch Web:
+
+```shell
+cc-switch-web start
+```
+
+It starts the local service and opens or prints:
+
+```text
+http://127.0.0.1:31235
+```
+
+If the browser does not open automatically, visit that URL manually.
+
+Common commands:
+
+```shell
+cc-switch-web start    # Start in the background and open/print the URL
+cc-switch-web status   # Show whether the daemon is running
+cc-switch-web open     # Open/print the browser URL
+cc-switch-web logs     # Show daemon logs
+cc-switch-web stop     # Stop the background daemon
+cc-switch-web server   # Run in the foreground for debugging
+```
+
+Optional user service:
+
+```shell
+systemctl --user enable --now cc-switch-web.service
+cc-switch-web open
+```
+
+Notes:
+
+- The Web package command is `cc-switch-web`, not `cc-switch`, to avoid conflicts with the native desktop app.
+- The daemon intentionally runs as the current user so it can read and write the user's Claude Code, Codex, Gemini, OpenCode, OpenClaw, Hermes, and CC Switch configuration files.
+- Native desktop-only features such as tray menus, file dialogs, window controls, deep-link events, and automatic app restart are degraded or unavailable in Web mode.
+
 <div align="center">
 
 # CC Switch
