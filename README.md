@@ -1,3 +1,101 @@
+# CC Switch Web / Headless Mode
+
+This branch adds a headless Web distribution for Linux environments where the
+Tauri/WebKitGTK desktop runtime is unavailable or unreliable, especially Ubuntu
+20.04. The Web build keeps the existing CC Switch Rust business logic, but runs
+it as a local HTTP daemon and serves the React UI in a normal browser.
+
+Key changes:
+
+- Adds `cc-switchd`, a headless daemon that listens on `127.0.0.1:31235` by default.
+- Adds browser-compatible Tauri shims so the existing React UI can run without a native WebView.
+- Splits Rust features so `--no-default-features --features headless` does not pull Tauri, GTK, GDK, or WebKitGTK runtime dependencies.
+- Adds a distributable Debian package target: `cc-switch-web`.
+- Keeps the original Tauri desktop app as the default build path.
+
+Build the Web `.deb` package:
+
+```shell
+pnpm package:web:deb
+```
+
+Install the generated package:
+
+```shell
+sudo apt install ./src-tauri/target/packages/cc-switch-web_*_*.deb
+```
+
+If you reinstall the same version, restart the running daemon so the browser UI
+talks to the newly installed binary:
+
+```shell
+sudo apt install --reinstall ./src-tauri/target/packages/cc-switch-web_*_*.deb
+systemctl --user restart cc-switch-web
+```
+
+Start CC Switch Web:
+
+```shell
+cc-switch-web start
+```
+
+It starts the local service and opens or prints:
+
+```text
+http://127.0.0.1:31235
+```
+
+If the browser does not open automatically, visit that URL manually.
+
+Common commands:
+
+```shell
+cc-switch-web start    # Start in the background and open/print the URL
+cc-switch-web status   # Show whether the daemon is running
+cc-switch-web open     # Open/print the browser URL
+cc-switch-web logs     # Show daemon logs
+cc-switch-web stop     # Stop the background daemon
+cc-switch-web server   # Run in the foreground for debugging
+```
+
+Optional user service:
+
+```shell
+systemctl --user enable --now cc-switch-web.service
+cc-switch-web open
+```
+
+For long-running use, the systemd user service is preferred because it keeps the
+daemon alive after package upgrades and gives clear status/log commands:
+
+```shell
+systemctl --user status cc-switch-web --no-pager
+journalctl --user -u cc-switch-web -n 100 --no-pager
+```
+
+Current Web mode coverage:
+
+- Core provider management, proxy control, failover queue, MCP, prompts, skills,
+  sessions, profiles, usage statistics, and live config sync are supported.
+- P1 Web support includes SQL import/export, local database backups, WebDAV/S3
+  sync, local proxy detection, global proxy testing, circuit breaker config, and
+  auto-failover controls.
+- P2 Web support includes OpenClaw/Hermes/OMO configuration, workspace and daily
+  memory files, stream reachability checks, model fetching, subscription/quota
+  queries, balance checks, optimizer/rectifier/log settings, deeplink import,
+  and tool version detection.
+- P3/native desktop actions are intentionally degraded in Web mode. Managed
+  OAuth/Copilot login flows, native file pickers, opening terminals/folders,
+  tray/window controls, auto-launch, app updater, and Claude plugin config are
+  not available from the headless daemon. When a file path is needed, provide it
+  explicitly instead of relying on a native dialog.
+
+Notes:
+
+- The Web package command is `cc-switch-web`, not `cc-switch`, to avoid conflicts with the native desktop app.
+- The daemon intentionally runs as the current user so it can read and write the user's Claude Code, Codex, Gemini, OpenCode, OpenClaw, Hermes, and CC Switch configuration files.
+- Default Web URL: `http://127.0.0.1:31235`.
+
 <div align="center">
 
 # CC Switch
