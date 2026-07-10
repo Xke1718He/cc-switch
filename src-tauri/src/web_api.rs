@@ -1,7 +1,8 @@
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::services::{ProviderService, SkillService, SpeedtestService};
+use crate::services::profile::{ProfilePayload, ProfileService};
+use crate::services::{McpService, PromptService, ProviderService, SkillService, SpeedtestService};
 use crate::store::AppState;
 use axum::{
     extract::{Path, State},
@@ -13,6 +14,7 @@ use axum::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
@@ -40,6 +42,69 @@ struct InvokeRequest {
 #[derive(Debug, Serialize)]
 struct InvokeError {
     error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct McpConfigResponse {
+    config_path: String,
+    servers: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileDto {
+    id: String,
+    name: String,
+    payload: ProfilePayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<i64>,
+}
+
+impl From<crate::database::Profile> for ProfileDto {
+    fn from(profile: crate::database::Profile) -> Self {
+        let payload = serde_json::from_str(&profile.payload).unwrap_or_else(|e| {
+            log::warn!(
+                "Failed to parse profile '{}' payload in web mode, using default: {e}",
+                profile.id
+            );
+            ProfilePayload::default()
+        });
+        Self {
+            id: profile.id,
+            name: profile.name,
+            payload,
+            created_at: profile.created_at,
+            updated_at: profile.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentProfileIds {
+    claude: Option<String>,
+    claude_desktop: Option<String>,
+    codex: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfilesResponse {
+    profiles: Vec<ProfileDto>,
+    current_ids: CurrentProfileIds,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelPricingInfo {
+    model_id: String,
+    display_name: String,
+    input_cost_per_million: String,
+    output_cost_per_million: String,
+    cache_read_cost_per_million: String,
+    cache_creation_cost_per_million: String,
 }
 
 pub async fn run(config: WebServerConfig, app_state: Arc<AppState>) -> Result<(), AppError> {
@@ -516,6 +581,259 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             ok(())
         }
 
+        "get_claude_mcp_status" => ok(crate::claude_mcp::get_mcp_status()?),
+        "read_claude_mcp_config" => ok(crate::claude_mcp::read_mcp_json()?),
+        "upsert_claude_mcp_server" => {
+            let id = arg_string(&args, &["id"])?;
+            let spec = args
+                .get("spec")
+                .cloned()
+                .ok_or_else(|| AppError::Config("missing argument `spec`".to_string()))?;
+            ok(crate::claude_mcp::upsert_mcp_server(&id, spec)?)
+        }
+        "delete_claude_mcp_server" => {
+            let id = arg_string(&args, &["id"])?;
+            ok(crate::claude_mcp::delete_mcp_server(&id)?)
+        }
+        "validate_mcp_command" => {
+            let cmd = arg_string(&args, &["cmd"])?;
+            ok(crate::claude_mcp::validate_command_in_path(&cmd)?)
+        }
+        "get_mcp_config" => {
+            let app = app_type(&args, "app")?;
+            let servers = get_mcp_servers_compat(state, app)?;
+            ok(McpConfigResponse {
+                config_path: crate::config::get_app_config_path()
+                    .to_string_lossy()
+                    .to_string(),
+                servers,
+            })
+        }
+        "upsert_mcp_server_in_config" => {
+            let app = app_type(&args, "app")?;
+            let id = arg_string(&args, &["id"])?;
+            let spec = args
+                .get("spec")
+                .cloned()
+                .ok_or_else(|| AppError::Config("missing argument `spec`".to_string()))?;
+            let sync_other_side =
+                arg_bool_opt(&args, &["syncOtherSide", "sync_other_side"])?.unwrap_or(false);
+            let existing_server = state.db.get_all_mcp_servers()?.get(&id).cloned();
+            let mut server = if let Some(mut existing) = existing_server {
+                existing.server = spec.clone();
+                existing.apps.set_enabled_for(&app, true);
+                existing
+            } else {
+                let mut apps = crate::app_config::McpApps::default();
+                apps.set_enabled_for(&app, true);
+                let name = spec
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_string();
+                crate::app_config::McpServer {
+                    id: id.clone(),
+                    name,
+                    server: spec,
+                    apps,
+                    description: None,
+                    homepage: None,
+                    docs: None,
+                    tags: Vec::new(),
+                }
+            };
+            if sync_other_side {
+                server.apps.claude = true;
+                server.apps.codex = true;
+                server.apps.gemini = true;
+                server.apps.opencode = true;
+            }
+            McpService::upsert_server(state, server)?;
+            ok(true)
+        }
+        "delete_mcp_server_in_config" => {
+            let id = arg_string(&args, &["id"])?;
+            ok(McpService::delete_server(state, &id)?)
+        }
+        "set_mcp_enabled" => {
+            let app = app_type(&args, "app")?;
+            let id = arg_string(&args, &["id"])?;
+            let enabled = arg_bool(&args, &["enabled"])?;
+            ok(set_mcp_enabled_compat(state, app, &id, enabled)?)
+        }
+        "get_mcp_servers" => ok(McpService::get_all_servers(state)?),
+        "upsert_mcp_server" => {
+            let server = take::<crate::app_config::McpServer>(&args, "server")?;
+            McpService::upsert_server(state, server)?;
+            ok(())
+        }
+        "delete_mcp_server" => {
+            let id = arg_string(&args, &["id"])?;
+            ok(McpService::delete_server(state, &id)?)
+        }
+        "toggle_mcp_app" => {
+            let server_id = arg_string(&args, &["serverId", "server_id"])?;
+            let app = app_type(&args, "app")?;
+            let enabled = arg_bool(&args, &["enabled"])?;
+            McpService::toggle_app(state, &server_id, app, enabled)?;
+            ok(())
+        }
+        "import_mcp_from_apps" => ok(McpService::import_from_all_apps(state)?),
+
+        "get_prompts" => {
+            let app = app_type(&args, "app")?;
+            ok(PromptService::get_prompts(state, app)?)
+        }
+        "upsert_prompt" => {
+            let app = app_type(&args, "app")?;
+            let id = arg_string(&args, &["id"])?;
+            let prompt = take::<crate::prompt::Prompt>(&args, "prompt")?;
+            PromptService::upsert_prompt(state, app, &id, prompt)?;
+            ok(())
+        }
+        "delete_prompt" => {
+            let app = app_type(&args, "app")?;
+            let id = arg_string(&args, &["id"])?;
+            PromptService::delete_prompt(state, app, &id)?;
+            ok(())
+        }
+        "enable_prompt" => {
+            let app = app_type(&args, "app")?;
+            let id = arg_string(&args, &["id"])?;
+            PromptService::enable_prompt(state, app, &id)?;
+            ok(())
+        }
+        "import_prompt_from_file" => {
+            let app = app_type(&args, "app")?;
+            ok(PromptService::import_from_file(state, app)?)
+        }
+        "get_current_prompt_file_content" => {
+            let app = app_type(&args, "app")?;
+            ok(PromptService::get_current_file_content(app)?)
+        }
+
+        "get_usage_summary" => ok(state.db.get_usage_summary(
+            arg_i64_opt(&args, &["startDate", "start_date"])?,
+            arg_i64_opt(&args, &["endDate", "end_date"])?,
+            arg_string_opt(&args, &["appType", "app_type"]).as_deref(),
+            arg_string_opt(&args, &["providerName", "provider_name"]).as_deref(),
+            arg_string_opt(&args, &["model"]).as_deref(),
+        )?),
+        "get_usage_summary_by_app" => ok(state.db.get_usage_summary_by_app(
+            arg_i64_opt(&args, &["startDate", "start_date"])?,
+            arg_i64_opt(&args, &["endDate", "end_date"])?,
+            arg_string_opt(&args, &["providerName", "provider_name"]).as_deref(),
+            arg_string_opt(&args, &["model"]).as_deref(),
+        )?),
+        "get_usage_trends" => ok(state.db.get_daily_trends(
+            arg_i64_opt(&args, &["startDate", "start_date"])?,
+            arg_i64_opt(&args, &["endDate", "end_date"])?,
+            arg_string_opt(&args, &["appType", "app_type"]).as_deref(),
+            arg_string_opt(&args, &["providerName", "provider_name"]).as_deref(),
+            arg_string_opt(&args, &["model"]).as_deref(),
+        )?),
+        "get_provider_stats" => ok(state.db.get_provider_stats(
+            arg_i64_opt(&args, &["startDate", "start_date"])?,
+            arg_i64_opt(&args, &["endDate", "end_date"])?,
+            arg_string_opt(&args, &["appType", "app_type"]).as_deref(),
+            arg_string_opt(&args, &["providerName", "provider_name"]).as_deref(),
+            arg_string_opt(&args, &["model"]).as_deref(),
+        )?),
+        "get_model_stats" => ok(state.db.get_model_stats(
+            arg_i64_opt(&args, &["startDate", "start_date"])?,
+            arg_i64_opt(&args, &["endDate", "end_date"])?,
+            arg_string_opt(&args, &["appType", "app_type"]).as_deref(),
+            arg_string_opt(&args, &["providerName", "provider_name"]).as_deref(),
+            arg_string_opt(&args, &["model"]).as_deref(),
+        )?),
+        "get_request_logs" => {
+            let filters = take::<crate::services::usage_stats::LogFilters>(&args, "filters")?;
+            let page = arg_u64_opt(&args, &["page"])?.unwrap_or(0) as u32;
+            let page_size = arg_u64_opt(&args, &["pageSize", "page_size"])?.unwrap_or(20) as u32;
+            ok(state.db.get_request_logs(&filters, page, page_size)?)
+        }
+        "get_request_detail" => {
+            let request_id = arg_string(&args, &["requestId", "request_id"])?;
+            ok(state.db.get_request_detail(&request_id)?)
+        }
+        "get_model_pricing" => ok(get_model_pricing(state)?),
+        "update_model_pricing" => {
+            update_model_pricing(
+                state,
+                arg_string(&args, &["modelId", "model_id"])?,
+                arg_string(&args, &["displayName", "display_name"])?,
+                arg_string(&args, &["inputCost", "input_cost"])?,
+                arg_string(&args, &["outputCost", "output_cost"])?,
+                arg_string(&args, &["cacheReadCost", "cache_read_cost"])?,
+                arg_string(&args, &["cacheCreationCost", "cache_creation_cost"])?,
+            )?;
+            ok(())
+        }
+        "delete_model_pricing" => {
+            let model_id = arg_string(&args, &["modelId", "model_id"])?;
+            delete_model_pricing(state, model_id)?;
+            ok(())
+        }
+        "check_provider_limits" => {
+            let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
+            let app_type = arg_string(&args, &["appType", "app_type"])?;
+            ok(state.db.check_provider_limits(&provider_id, &app_type)?)
+        }
+        "sync_session_usage" => ok(sync_session_usage(state)?),
+        "get_usage_data_sources" => {
+            ok(crate::services::session_usage::get_data_source_breakdown(&state.db)?)
+        }
+
+        "list_profiles" => ok(list_profiles(state)?),
+        "create_profile" => {
+            let name = arg_string(&args, &["name"])?;
+            let scope =
+                crate::services::profile::ProfileScope::parse(&arg_string(&args, &["scope"])?)
+                    .map_err(|e| AppError::Config(e.to_string()))?;
+            ok(ProfileDto::from(ProfileService::create(state, &name, scope)?))
+        }
+        "update_profile" => {
+            let id = arg_string(&args, &["id"])?;
+            let scope = arg_string_opt(&args, &["scope"])
+                .map(|scope| crate::services::profile::ProfileScope::parse(&scope))
+                .transpose()
+                .map_err(|e| AppError::Config(e.to_string()))?;
+            ok(ProfileDto::from(ProfileService::update(
+                state,
+                &id,
+                arg_string_opt(&args, &["name"]),
+                arg_bool_opt(&args, &["resnapshot"])?.unwrap_or(false),
+                scope,
+            )?))
+        }
+        "delete_profile" => {
+            let id = arg_string(&args, &["id"])?;
+            ProfileService::delete(state, &id)?;
+            ok(())
+        }
+        "clear_current_profile" => {
+            let scope =
+                crate::services::profile::ProfileScope::parse(&arg_string(&args, &["scope"])?)
+                    .map_err(|e| AppError::Config(e.to_string()))?;
+            state.db.set_current_profile_id(scope.as_str(), None)?;
+            ok(())
+        }
+        "apply_profile" => {
+            let id = arg_string(&args, &["id"])?;
+            let scope =
+                crate::services::profile::ProfileScope::parse(&arg_string(&args, &["scope"])?)
+                    .map_err(|e| AppError::Config(e.to_string()))?;
+            let (warnings, should_stop_proxy) = ProfileService::apply(state, &id, scope)?;
+            if should_stop_proxy {
+                state
+                    .proxy_service
+                    .stop()
+                    .await
+                    .map_err(AppError::Config)?;
+            }
+            ok(warnings)
+        }
+
         "get_installed_skills" => ok(SkillService::get_all_installed(&state.db)
             .map_err(|e| AppError::Config(e.to_string()))?),
         "get_skill_backups" => {
@@ -790,6 +1108,201 @@ fn uninstall_skill_by_directory(
     SkillService::uninstall(&state.db, &skill.id).map_err(|e| AppError::Config(e.to_string()))
 }
 
+fn list_profiles(state: &AppState) -> Result<ProfilesResponse, AppError> {
+    let profiles = ProfileService::list(state)?;
+    let current_ids = CurrentProfileIds {
+        claude: state
+            .db
+            .get_current_profile_id(crate::services::profile::ProfileScope::Claude.as_str())?,
+        claude_desktop: state.db.get_current_profile_id(
+            crate::services::profile::ProfileScope::ClaudeDesktop.as_str(),
+        )?,
+        codex: state
+            .db
+            .get_current_profile_id(crate::services::profile::ProfileScope::Codex.as_str())?,
+    };
+    Ok(ProfilesResponse {
+        profiles: profiles.into_iter().map(ProfileDto::from).collect(),
+        current_ids,
+    })
+}
+
+#[allow(deprecated)]
+fn get_mcp_servers_compat(
+    state: &AppState,
+    app: AppType,
+) -> Result<HashMap<String, serde_json::Value>, AppError> {
+    McpService::get_servers(state, app)
+}
+
+#[allow(deprecated)]
+fn set_mcp_enabled_compat(
+    state: &AppState,
+    app: AppType,
+    id: &str,
+    enabled: bool,
+) -> Result<bool, AppError> {
+    McpService::set_enabled(state, app, id, enabled)
+}
+
+fn get_model_pricing(state: &AppState) -> Result<Vec<ModelPricingInfo>, AppError> {
+    state.db.ensure_model_pricing_seeded()?;
+    let db = state.db.clone();
+    let conn = crate::database::lock_conn!(db.conn);
+
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='model_pricing'",
+            [],
+            |row| row.get::<_, i64>(0).map(|count| count > 0),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT model_id, display_name, input_cost_per_million, output_cost_per_million,
+                cache_read_cost_per_million, cache_creation_cost_per_million
+         FROM model_pricing
+         ORDER BY display_name",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ModelPricingInfo {
+            model_id: row.get(0)?,
+            display_name: row.get(1)?,
+            input_cost_per_million: row.get(2)?,
+            output_cost_per_million: row.get(3)?,
+            cache_read_cost_per_million: row.get(4)?,
+            cache_creation_cost_per_million: row.get(5)?,
+        })
+    })?;
+
+    let mut pricing = Vec::new();
+    for row in rows {
+        pricing.push(row?);
+    }
+    Ok(pricing)
+}
+
+fn update_model_pricing(
+    state: &AppState,
+    model_id: String,
+    display_name: String,
+    input_cost: String,
+    output_cost: String,
+    cache_read_cost: String,
+    cache_creation_cost: String,
+) -> Result<(), AppError> {
+    let model_id = model_id.trim().to_string();
+    let display_name = display_name.trim().to_string();
+    if model_id.is_empty() {
+        return Err(AppError::localized(
+            "usage.modelIdRequired",
+            "模型 ID 不能为空",
+            "Model ID is required",
+        ));
+    }
+    if display_name.is_empty() {
+        return Err(AppError::localized(
+            "usage.displayNameRequired",
+            "显示名称不能为空",
+            "Display name is required",
+        ));
+    }
+
+    for (label, value) in [
+        ("input_cost", &input_cost),
+        ("output_cost", &output_cost),
+        ("cache_read_cost", &cache_read_cost),
+        ("cache_creation_cost", &cache_creation_cost),
+    ] {
+        let parsed = rust_decimal::Decimal::from_str(value.trim()).map_err(|e| {
+            AppError::localized(
+                "usage.invalidPrice",
+                format!("{label} 价格无效: {value} - {e}"),
+                format!("{label} price is invalid: {value} - {e}"),
+            )
+        })?;
+        if parsed < rust_decimal::Decimal::ZERO {
+            return Err(AppError::localized(
+                "usage.invalidPrice",
+                format!("{label} 价格必须为非负数: {value}"),
+                format!("{label} price must be non-negative: {value}"),
+            ));
+        }
+    }
+
+    {
+        let db = state.db.clone();
+        let conn = crate::database::lock_conn!(db.conn);
+        conn.execute(
+            "INSERT OR REPLACE INTO model_pricing (
+                model_id, display_name, input_cost_per_million, output_cost_per_million,
+                cache_read_cost_per_million, cache_creation_cost_per_million
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                model_id,
+                display_name,
+                input_cost.trim(),
+                output_cost.trim(),
+                cache_read_cost.trim(),
+                cache_creation_cost.trim()
+            ],
+        )
+        .map_err(|e| AppError::Database(format!("更新模型定价失败: {e}")))?;
+    }
+
+    if let Err(e) = state.db.backfill_missing_usage_costs_for_model(&model_id) {
+        log::warn!(
+            "Failed to backfill usage costs after pricing update (model_id={model_id}): {e}"
+        );
+    }
+    Ok(())
+}
+
+fn delete_model_pricing(state: &AppState, model_id: String) -> Result<(), AppError> {
+    let db = state.db.clone();
+    let conn = crate::database::lock_conn!(db.conn);
+    conn.execute(
+        "DELETE FROM model_pricing WHERE model_id = ?1",
+        rusqlite::params![model_id],
+    )
+    .map_err(|e| AppError::Database(format!("删除模型定价失败: {e}")))?;
+    Ok(())
+}
+
+fn sync_session_usage(
+    state: &AppState,
+) -> Result<crate::services::session_usage::SessionSyncResult, AppError> {
+    let mut result = crate::services::session_usage::sync_claude_session_logs(&state.db)?;
+
+    match crate::services::session_usage_codex::sync_codex_usage(&state.db) {
+        Ok(next) => merge_session_sync_result(&mut result, next),
+        Err(e) => result.errors.push(format!("Codex sync failed: {e}")),
+    }
+    match crate::services::session_usage_gemini::sync_gemini_usage(&state.db) {
+        Ok(next) => merge_session_sync_result(&mut result, next),
+        Err(e) => result.errors.push(format!("Gemini sync failed: {e}")),
+    }
+    match crate::services::session_usage_opencode::sync_opencode_usage(&state.db) {
+        Ok(next) => merge_session_sync_result(&mut result, next),
+        Err(e) => result.errors.push(format!("OpenCode sync failed: {e}")),
+    }
+
+    Ok(result)
+}
+
+fn merge_session_sync_result(
+    target: &mut crate::services::session_usage::SessionSyncResult,
+    source: crate::services::session_usage::SessionSyncResult,
+) {
+    target.imported += source.imported;
+    target.skipped += source.skipped;
+    target.files_scanned += source.files_scanned;
+    target.errors.extend(source.errors);
+}
+
 fn get_config_dir(app: String) -> Result<String, AppError> {
     let dir = match AppType::from_str(&app).map_err(|e| AppError::Config(e.to_string()))? {
         AppType::Claude => crate::config::get_claude_config_dir(),
@@ -855,6 +1368,18 @@ fn arg_u64_opt(args: &Value, keys: &[&str]) -> Result<Option<u64>, AppError> {
         if let Some(value) = args.get(*key) {
             return value
                 .as_u64()
+                .map(Some)
+                .ok_or_else(|| AppError::Config(format!("argument `{key}` must be number")));
+        }
+    }
+    Ok(None)
+}
+
+fn arg_i64_opt(args: &Value, keys: &[&str]) -> Result<Option<i64>, AppError> {
+    for key in keys {
+        if let Some(value) = args.get(*key) {
+            return value
+                .as_i64()
                 .map(Some)
                 .ok_or_else(|| AppError::Config(format!("argument `{key}` must be number")));
         }
