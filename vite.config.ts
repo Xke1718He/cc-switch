@@ -39,6 +39,10 @@ export default defineConfig(({ command, mode }) => {
           __dirname,
           "./src/lib/web-shims/tauri-updater.ts",
         ),
+        "@tauri-apps/plugin-log": path.resolve(
+          __dirname,
+          "./src/lib/web-shims/tauri-log.ts",
+        ),
       }
     : {};
 

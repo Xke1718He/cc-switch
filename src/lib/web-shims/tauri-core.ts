@@ -2,6 +2,10 @@ export interface InvokeOptions {
   headers?: HeadersInit;
 }
 
+export function isTauri(): boolean {
+  return false;
+}
+
 export async function invoke<T = unknown>(
   command: string,
   args?: Record<string, unknown>,
