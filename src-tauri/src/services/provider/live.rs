@@ -842,7 +842,11 @@ fn get_codex_managed_oauth_live_auth_value(
     account_id: String,
 ) -> Result<Value, AppError> {
     std::thread::spawn(move || {
-        tauri::async_runtime::block_on(async move {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async move {
             let bundle = manager
                 .get_valid_token_bundle_for_account(&account_id)
                 .await
@@ -883,7 +887,11 @@ pub(crate) fn prepare_codex_managed_oauth_live_auth_switch_away(
     account_id: String,
 ) -> Result<Option<String>, AppError> {
     std::thread::spawn(move || {
-        tauri::async_runtime::block_on(async move {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async move {
             manager
                 .prepare_live_auth_for_account_switch_away(&account_id)
                 .await
