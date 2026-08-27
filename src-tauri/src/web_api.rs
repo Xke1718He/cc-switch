@@ -404,6 +404,14 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             let models_url = arg_string_opt(&args, &["modelsUrl", "models_url"]);
             let custom_user_agent =
                 arg_string_opt(&args, &["customUserAgent", "custom_user_agent"]);
+            let api_format = arg_string_opt(&args, &["apiFormat", "api_format"]);
+            let request_headers = args
+                .get("requestHeaders")
+                .or_else(|| args.get("request_headers"))
+                .cloned()
+                .map(serde_json::from_value::<std::collections::BTreeMap<String, String>>)
+                .transpose()
+                .map_err(|error| AppError::Config(format!("invalid request headers: {error}")))?;
             let user_agent = crate::provider::parse_custom_user_agent(custom_user_agent.as_deref())
                 .ok()
                 .flatten();
@@ -413,6 +421,8 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
                 is_full_url,
                 models_url.as_deref(),
                 user_agent,
+                api_format.as_deref(),
+                request_headers.as_ref(),
             )
             .await
             .map_err(AppError::Config)?)
@@ -900,14 +910,6 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
         "get_optimizer_config" => ok(state.db.get_optimizer_config()?),
         "set_optimizer_config" => {
             let config = take::<crate::proxy::types::OptimizerConfig>(&args, "config")?;
-            match config.cache_ttl.as_str() {
-                "5m" | "1h" => {}
-                other => {
-                    return Err(AppError::Config(format!(
-                        "Invalid cache_ttl value: '{other}'. Allowed values: '5m', '1h'"
-                    )))
-                }
-            }
             state.db.set_optimizer_config(&config)?;
             ok(true)
         }
@@ -2390,6 +2392,8 @@ fn get_config_dir(app: String) -> Result<String, AppError> {
         AppType::OpenCode => crate::opencode_config::get_opencode_dir(),
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
+        AppType::GrokBuild => crate::grok_config::get_grok_config_dir(),
+        AppType::Pi => crate::pi_config::get_pi_agent_dir()?,
     };
     Ok(dir.to_string_lossy().to_string())
 }
