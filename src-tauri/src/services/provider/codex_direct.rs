@@ -244,7 +244,7 @@ pub(crate) async fn prepare_official_rows(
 pub(crate) async fn off_runtime<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, AppError> {
-    tauri::async_runtime::spawn_blocking(work)
+    crate::runtime::async_runtime::spawn_blocking(work)
         .await
         .map_err(|error| AppError::Message(format!("后台线程异常退出: {error}")))
 }

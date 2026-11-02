@@ -58,6 +58,8 @@ mod services;
 mod session_manager;
 mod settings;
 mod store;
+#[path = "commands/misc.rs"]
+pub(crate) mod tool_commands;
 
 #[cfg(feature = "desktop")]
 mod tray;

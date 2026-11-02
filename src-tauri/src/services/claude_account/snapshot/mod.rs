@@ -100,7 +100,7 @@ static SWITCH: Mutex<()> = Mutex::new(());
 /// - `"overrideDir"`：设了别的 Claude 配置目录覆盖（默认槽位不在 `~/.claude`）。这时绑号卡
 ///   只能从卡片「打开终端」使用。
 pub fn blocked_reason() -> Option<&'static str> {
-    if crate::commands::tool_runs_in_wsl("claude") {
+    if crate::tool_commands::tool_runs_in_wsl("claude") {
         return Some("wsl");
     }
     crate::settings::get_claude_override_dir().map(|_| "overrideDir")

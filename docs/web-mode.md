@@ -80,7 +80,27 @@ is added. The API can read and write local AI-tool configuration and secrets.
 
 ## Current Scope
 
-The first web-mode pass covers the core provider, proxy, settings, environment,
-and common configuration commands. Native desktop-only features such as tray
+Web mode uses the current provider editor and route/Stack services, including
+direct-provider state, proxy client addresses, and restoring route state at startup.
+Session reading supports streamed transcript chunks, paged block content, image
+bytes, and Markdown downloads in the browser. Connectivity checks use the same
+fixed defaults as the desktop app.
+
+Native desktop-only features such as tray
 menus, file dialogs, window controls, deep-link events, and automatic app restart
 are intentionally degraded or unavailable in browser mode.
+Managed OAuth/Copilot sign-in flows remain unavailable in Web mode.
+
+## Compatibility Checks
+
+```bash
+pnpm build:web
+pnpm typecheck
+pnpm exec vitest run tests/web/tauri-core.test.ts
+cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --features headless --bin cc-switchd
+cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --features headless --test headless_web
+```
+
+The HTTP regression test launches a daemon with a temporary home and configuration
+directory. It verifies provider editing, entering/exiting route mode, session
+streaming, and paged content without modifying the user's configuration.

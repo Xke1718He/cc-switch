@@ -676,7 +676,7 @@ pub fn cancel_login(flow_id: &str) {
 
 fn abandon(login: PendingLogin) {
     login.task.abort();
-    tauri::async_runtime::spawn(async move {
+    crate::runtime::async_runtime::spawn(async move {
         let _ = platform_call(
             "auth_cancel",
             json!({"authorize_id": login.authorize_id, "code_verifier": login.verifier}),

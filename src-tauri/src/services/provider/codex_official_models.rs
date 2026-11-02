@@ -126,7 +126,7 @@ impl Env {
         Self {
             codex_version: Box::new(|| {
                 newest_codex_version(
-                    crate::commands::local_tool_version("codex"),
+                    crate::tool_commands::local_tool_version("codex"),
                     recent_thread_versions(),
                 )
             }),
@@ -306,7 +306,7 @@ fn fetch_models(login: &OfficialLogin, version: &str, etag: Option<&str>) -> Fet
     let account_id = login.account_id.clone();
     let etag = etag.map(str::to_string);
     let run = move || {
-        tauri::async_runtime::block_on(async move {
+        crate::runtime::async_runtime::block_on(async move {
             let mut request = crate::proxy::http_client::get()
                 .get(crate::services::codex_oauth_models::CODEX_OAUTH_MODELS_URL)
                 .query(&[("client_version", version.as_str())])
@@ -787,7 +787,7 @@ pub(crate) fn after_refresh() {
     let Some(state) = state_slot().get().cloned() else {
         return;
     };
-    tauri::async_runtime::spawn(async move {
+    crate::runtime::async_runtime::spawn(async move {
         crate::mode::controller::resync_codex_if_behind(&state).await;
     });
 }
@@ -796,7 +796,7 @@ pub(crate) fn after_refresh() {
 /// 定时器：从进程启动开始计时的话，每次只运行几小时的用户永远等不到刷新。
 pub(crate) fn start_background_checks(state: crate::store::AppState) {
     let _ = state_slot().set(state.clone());
-    tauri::async_runtime::spawn(async move {
+    crate::runtime::async_runtime::spawn(async move {
         loop {
             crate::mode::controller::check_codex_official_models(&state).await;
             tokio::time::sleep(CHECK_EVERY).await;

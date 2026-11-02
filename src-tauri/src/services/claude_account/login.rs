@@ -310,7 +310,7 @@ fn supervise(child: &mut Child, cancel: &AtomicBool, timeout: Duration) -> Super
         if let Some(reason) = reason {
             // 整树终止：Windows 上 npm 装的 claude.cmd 直接子进程是 cmd.exe，真正等授权的
             // node 是它的后代，只杀 cmd.exe 的话 node 还占着输出管道，读输出的线程等不到 EOF
-            crate::commands::terminate_child_tree(child);
+            crate::tool_commands::terminate_child_tree(child);
             let _ = child.wait();
             return reason;
         }
@@ -450,7 +450,7 @@ fn spawn_login(
     opener: Option<&Path>,
     opened_file: &Path,
 ) -> Result<Child, AppError> {
-    let mut cmd = crate::commands::detected_tool_command(
+    let mut cmd = crate::tool_commands::detected_tool_command(
         "claude",
         &["auth", "login", "--claudeai"],
         LOCATE_TIMEOUT,

@@ -89,7 +89,8 @@ fn ran_recently(account: &str, claim: bool) -> bool {
 }
 
 fn run_usage(config_dir: Option<&Path>) -> Result<(), String> {
-    let mut cmd = crate::commands::detected_tool_command("claude", &usage_args(), LOCATE_TIMEOUT)?;
+    let mut cmd =
+        crate::tool_commands::detected_tool_command("claude", &usage_args(), LOCATE_TIMEOUT)?;
     clear_account_env(&mut cmd);
     match config_dir {
         Some(dir) => cmd.env("CLAUDE_CONFIG_DIR", dir),
@@ -118,7 +119,7 @@ fn run_usage(config_dir: Option<&Path>) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(100))
             }
             Ok(None) => {
-                crate::commands::terminate_child_tree(&mut child);
+                crate::tool_commands::terminate_child_tree(&mut child);
                 let _ = child.wait();
                 return Err("超时".to_string());
             }

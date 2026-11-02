@@ -135,26 +135,6 @@ struct DetectedProxy {
 }
 
 #[derive(Debug, Serialize)]
-struct ToolVersion {
-    name: String,
-    version: Option<String>,
-    latest_version: Option<String>,
-    error: Option<String>,
-    installed_but_broken: bool,
-    env_type: String,
-    wsl_distro: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WslShellPreferenceInput {
-    #[serde(default)]
-    wsl_shell: Option<String>,
-    #[serde(default)]
-    wsl_shell_flag: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DailyMemoryFileInfo {
     filename: String,
@@ -176,6 +156,7 @@ struct DailyMemorySearchResult {
 }
 
 pub async fn run(config: WebServerConfig, app_state: Arc<AppState>) -> Result<(), AppError> {
+    let shutdown_state = app_state.clone();
     let state = WebState { app_state };
     let app = build_router(config.ui_dir, state);
     let listener = tokio::net::TcpListener::bind(config.listen)
@@ -185,10 +166,30 @@ pub async fn run(config: WebServerConfig, app_state: Arc<AppState>) -> Result<()
         .local_addr()
         .map_err(|e| AppError::Config(format!("failed to read web server address: {e}")))?;
 
+    crate::mode::controller::startup(&shutdown_state).await;
+    crate::services::provider::codex_official_models::start_background_checks(
+        (*shutdown_state).clone(),
+    );
     println!("CC Switch web UI: http://{addr}");
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to register termination signal");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+        })
         .await
-        .map_err(|e| AppError::Config(format!("web server failed: {e}")))
+        .map_err(|e| AppError::Config(format!("web server failed: {e}")));
+    crate::mode::controller::detach_all(&shutdown_state).await;
+    result
 }
 
 fn build_router(ui_dir: PathBuf, state: WebState) -> Router {
@@ -221,12 +222,22 @@ async fn invoke(
     Path(command): Path<String>,
     Json(request): Json<InvokeRequest>,
 ) -> Response {
-    match dispatch(&state.app_state, &command, request.args).await {
-        Ok(value) => Json(value).into_response(),
+    let result = match command.as_str() {
+        "stream_session_messages" => stream_session_response(request.args),
+        "get_session_image" => session_image_response(request.args).await,
+        _ => dispatch(&state.app_state, &command, request.args)
+            .await
+            .map(|value| Json(value).into_response()),
+    };
+    match result {
+        Ok(response) => response,
         Err(error) => (
             StatusCode::BAD_REQUEST,
             Json(InvokeError {
-                error: error.to_string(),
+                error: match &error {
+                    AppError::Config(message) => message.clone(),
+                    _ => error.to_string(),
+                },
             }),
         )
             .into_response(),
@@ -250,7 +261,7 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
         }
         "restore_codex_unified_history" => ok(restore_codex_unified_history().await?),
         "is_portable_mode" => ok(is_portable_mode()),
-        "get_config_dir" => ok(get_config_dir(arg_string(&args, &["app"])?)),
+        "get_config_dir" => ok(get_config_dir(arg_string(&args, &["app"])?)?),
         "get_app_config_path" => ok(crate::config::get_app_config_path()
             .to_string_lossy()
             .to_string()),
@@ -284,18 +295,28 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             let app = app_type(&args, "app")?;
             let provider = take::<Provider>(&args, "provider")?;
             let add_to_live = arg_bool_opt(&args, &["addToLive", "add_to_live"])?.unwrap_or(true);
-            ok(ProviderService::add(state, app, provider, add_to_live)?)
+            let editor = optional::<crate::services::provider::EditorSave>(&args, "editorSave")?;
+            ok(ProviderService::add_from_editor(state, app, provider, add_to_live, editor)?)
         }
         "update_provider" => {
             let app = app_type(&args, "app")?;
             let provider = take::<Provider>(&args, "provider")?;
             let original_id = arg_string_opt(&args, &["originalId", "original_id"]);
-            ok(ProviderService::update(
-                state,
-                app,
-                original_id.as_deref(),
-                provider,
-            )?)
+            let editor = optional::<crate::services::provider::EditorSave>(&args, "editorSave")?;
+            ok(ProviderService::update_from_editor(state, app, original_id.as_deref(), provider, editor)?)
+        }
+        "get_provider_editor_view" => {
+            let app = app_type(&args, "app")?;
+            let settings = take::<Value>(&args, "settingsConfig")?;
+            let id = arg_string_opt(&args, &["providerId", "provider_id"]);
+            let category = ProviderService::editor_category(state, &app, id.as_deref(), arg_string_opt(&args, &["category"]))?;
+            let meta = optional::<crate::provider::ProviderMeta>(&args, "meta")?;
+            ok(ProviderService::editor_view_with_meta(state, app, &settings, category.as_deref(), id.as_deref(), meta.as_ref())?)
+        }
+        "add_provider_to_live_config" => {
+            let app = app_type(&args, "app")?;
+            ProviderService::add_to_live_config(state, app, &arg_string(&args, &["id"])?)?;
+            ok(true)
         }
         "delete_provider" => {
             let app = app_type(&args, "app")?;
@@ -584,6 +605,8 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
                 .map_err(AppError::Config)?;
             if takeover.claude
                 || takeover.codex
+                || takeover.grokbuild
+                || takeover.claude_desktop
                 || takeover.gemini
                 || takeover.opencode
                 || takeover.openclaw
@@ -596,11 +619,7 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             ok(())
         }
         "stop_proxy_with_restore" => {
-            state
-                .proxy_service
-                .stop_with_restore()
-                .await
-                .map_err(AppError::Config)?;
+            crate::mode::controller::exit_all(state).await.map_err(AppError::Config)?;
             ok(())
         }
         "get_proxy_status" => ok(state
@@ -620,32 +639,52 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             .await
             .map_err(AppError::Config)?),
         "set_proxy_takeover_for_app" => {
-            let app_type = arg_string(&args, &["appType", "app_type"])?;
+            let app = mode_app(&args)?;
             let enabled = arg_bool(&args, &["enabled"])?;
-            state
-                .proxy_service
-                .set_takeover_for_app(&app_type, enabled)
-                .await
-                .map_err(AppError::Config)?;
+            if enabled {
+                let stack = arg_bool_opt(&args, &["stack"])?.unwrap_or(false);
+                let route = arg_string_opt(&args, &["route"]);
+                crate::mode::controller::enter_with_route(state, &app, stack, route.as_deref()).await
+            } else {
+                crate::mode::controller::exit(state, &app).await
+            }.map_err(AppError::Config)?;
             ok(())
         }
         "switch_proxy_provider" => {
-            let app_type = arg_string(&args, &["appType", "app_type"])?;
-            let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
-            let provider = state
-                .db
-                .get_provider_by_id(&provider_id, &app_type)?
-                .ok_or_else(|| AppError::Config(format!("provider not found: {provider_id}")))?;
-            if provider.category.as_deref() == Some("official") {
-                return Err(AppError::Config(
-                    "代理接管模式下不能切换到官方供应商".to_string(),
-                ));
-            }
-            state
-                .proxy_service
-                .switch_proxy_target(&app_type, &provider_id)
-                .await
-                .map_err(AppError::Config)?;
+            let app = mode_app(&args)?;
+            let id = arg_string(&args, &["providerId", "provider_id"])?;
+            crate::mode::controller::switch_route(state, &app, &id).await.map_err(AppError::Config)?;
+            ok(())
+        }
+        "set_proxy_route" => {
+            let app = mode_app(&args)?;
+            let id = arg_string(&args, &["providerId", "provider_id"])?;
+            ok(crate::mode::controller::set_route(state, &app, &id).await.map_err(AppError::Config)?)
+        }
+        "get_app_mode" => ok(crate::mode::controller::app_mode_view(state, &mode_app(&args)?).map_err(AppError::Config)?),
+        "get_direct_provider" => ok(crate::mode::controller::direct_provider_id(state, &mode_app(&args)?)?),
+        "take_startup_attach_failures" => ok(crate::mode::controller::take_startup_attach_failures()),
+        "exit_proxy_apps_in_mode" => ok(crate::mode::controller::exit_apps_in_mode(state, arg_bool(&args, &["stack"])?).await.map_err(AppError::Config)?),
+        "get_proxy_stack" => ok(crate::mode::controller::stack_view_with_clients(state, &mode_app(&args)?).await.map_err(AppError::Config)?),
+        "set_proxy_stack_member" => {
+            let app = mode_app(&args)?;
+            let id = arg_string(&args, &["providerId", "provider_id"])?;
+            let enabled = arg_bool(&args, &["enabled"])?;
+            ok(crate::mode::controller::set_stack_member(state, &app, &id, enabled).await
+                .map_err(|error| AppError::Config(serde_json::to_string(&error).unwrap_or(error.message)))?)
+        }
+        "adopt_codex_stack_catalog" => ok(crate::mode::controller::adopt_codex_stack_catalog(state).await.map_err(AppError::Config)?),
+        "restart_codex_app_server_daemon" => ok(crate::services::provider::codex_direct::off_runtime(
+            crate::services::provider::codex_client_catalog::restart_daemon).await?.map_err(AppError::Config)?),
+        "acknowledge_codex_stale_clients" => {
+            crate::services::provider::codex_direct::off_runtime(|| crate::services::provider::codex_client_catalog::acknowledge(
+                &crate::live::engine::DeviceStore::for_device())).await?;
+            ok(())
+        }
+        "get_proxy_client_host" => ok(crate::settings::get_proxy_client_host().unwrap_or_default()),
+        "set_proxy_client_host" => {
+            crate::settings::set_proxy_client_host(&arg_string(&args, &["host"])?)?;
+            crate::mode::controller::resync_routes(state).await.map_err(AppError::Config)?;
             ok(())
         }
         "get_proxy_config" => ok(state
@@ -665,7 +704,9 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
         "get_global_proxy_config" => ok(state.db.get_global_proxy_config().await?),
         "update_global_proxy_config" => {
             let config = take::<crate::proxy::types::GlobalProxyConfig>(&args, "config")?;
-            state.db.update_global_proxy_config(config).await?;
+            if state.proxy_service.update_global_config(&config).await.map_err(AppError::Config)? {
+                crate::mode::controller::resync_routes(state).await.map_err(AppError::Config)?;
+            }
             ok(())
         }
         "get_proxy_config_for_app" => {
@@ -673,8 +714,11 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             ok(state.db.get_proxy_config_for_app(&app_type).await?)
         }
         "update_proxy_config_for_app" => {
-            let config = take::<crate::proxy::types::AppProxyConfig>(&args, "config")?;
+            let mut config = take::<crate::proxy::types::AppProxyConfig>(&args, "config")?;
             let app_type = config.app_type.clone();
+            require_failover_app(&app_type).map_err(AppError::Config)?;
+            let app = AppType::from_str(&app_type).map_err(|e| AppError::Config(e.to_string()))?;
+            config.enabled = crate::mode::current::is_proxy(&app);
             let circuit = crate::proxy::CircuitBreakerConfig::from(&config);
             state.db.update_proxy_config_for_app(config).await?;
             state
@@ -682,19 +726,6 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
                 .update_circuit_breaker_config_for_app(&app_type, circuit)
                 .await
                 .map_err(AppError::Config)?;
-            ok(())
-        }
-        "get_default_cost_multiplier" => {
-            let app_type = arg_string(&args, &["appType", "app_type"])?;
-            ok(state.db.get_default_cost_multiplier(&app_type).await?)
-        }
-        "set_default_cost_multiplier" => {
-            let app_type = arg_string(&args, &["appType", "app_type"])?;
-            let value = arg_string(&args, &["value"])?;
-            state
-                .db
-                .set_default_cost_multiplier(&app_type, &value)
-                .await?;
             ok(())
         }
         "get_pricing_model_source" => {
@@ -726,6 +757,8 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
         "add_to_failover_queue" => {
             let app_type = arg_string(&args, &["appType", "app_type"])?;
             let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
+            require_failover_app(&app_type).map_err(AppError::Config)?;
+            require_failover_provider(&state.db, &app_type, &provider_id).map_err(AppError::Config)?;
             state.db.add_to_failover_queue(&app_type, &provider_id)?;
             ok(())
         }
@@ -802,19 +835,6 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             state.db.set_config_snippet_cleared("claude", is_cleared)?;
             ok(())
         }
-        "update_toml_common_config_snippet" => {
-            let config_toml = arg_string(&args, &["configToml", "config_toml"])?;
-            let snippet_toml = arg_string(&args, &["snippetToml", "snippet_toml"])?;
-            let enabled = arg_bool(&args, &["enabled"])?;
-            ok(
-                crate::services::provider::update_toml_common_config_snippet(
-                    &config_toml,
-                    &snippet_toml,
-                    enabled,
-                )?,
-            )
-        }
-
         "get_global_proxy_url" => ok(state.db.get_global_proxy_url()?),
         "set_global_proxy_url" => {
             let url = arg_string(&args, &["url"])?;
@@ -1064,12 +1084,6 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             ok(())
         }
 
-        "get_stream_check_config" => ok(state.db.get_stream_check_config()?),
-        "save_stream_check_config" => {
-            let config = take::<crate::services::stream_check::StreamCheckConfig>(&args, "config")?;
-            state.db.save_stream_check_config(&config)?;
-            ok(())
-        }
         "stream_check_provider" => {
             let app = app_type(&args, "appType")?;
             let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
@@ -1225,15 +1239,7 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             let scope =
                 crate::services::profile::ProfileScope::parse(&arg_string(&args, &["scope"])?)
                     .map_err(|e| AppError::Config(e.to_string()))?;
-            let (warnings, should_stop_proxy) = ProfileService::apply(state, &id, scope)?;
-            if should_stop_proxy {
-                state
-                    .proxy_service
-                    .stop()
-                    .await
-                    .map_err(AppError::Config)?;
-            }
-            ok(warnings)
+            ok(ProfileService::apply(state, &id, scope)?)
         }
 
         "get_installed_skills" => ok(SkillService::get_all_installed(&state.db)
@@ -1390,11 +1396,19 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
             let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
             let source_path = arg_string(&args, &["sourcePath", "source_path"])?;
             ok(tokio::task::spawn_blocking(move || {
-                crate::session_manager::load_messages(&provider_id, &source_path)
+                crate::session_manager::load_transcript(&provider_id, &source_path).map(|loaded| loaded.transcript.messages.clone())
             })
             .await
             .map_err(|e| AppError::Config(format!("failed to load session messages: {e}")))?
             .map_err(AppError::Config)?)
+        }
+        "get_session_block_content" => {
+            let provider = arg_string(&args, &["providerId", "provider_id"])?;
+            let path = arg_string(&args, &["sourcePath", "source_path"])?;
+            let reference = take::<crate::session_manager::model::ContentRef>(&args, "contentRef")?;
+            let source = crate::session_manager::content::validate_source(&provider, &path).map_err(AppError::Config)?;
+            let text = crate::session_manager::content::resolve_content_ref(&source, &reference).map_err(AppError::Config)?;
+            ok(crate::session_manager::content::paginate(&text, optional(&args, "offset")?, optional(&args, "limit")?))
         }
         "delete_session" => {
             let provider_id = arg_string(&args, &["providerId", "provider_id"])?;
@@ -1470,29 +1484,13 @@ async fn dispatch(state: &AppState, command: &str, args: Value) -> Result<Value,
         }
 
         "get_tool_versions" => {
-            let tools = args
-                .get("tools")
-                .cloned()
-                .map(serde_json::from_value::<Vec<String>>)
-                .transpose()
-                .map_err(|e| AppError::Config(e.to_string()))?;
-            let _wsl_shell_by_tool = args
-                .get("wslShellByTool")
-                .or_else(|| args.get("wsl_shell_by_tool"))
-                .cloned()
-                .map(serde_json::from_value::<HashMap<String, WslShellPreferenceInput>>)
-                .transpose()
-                .map_err(|e| AppError::Config(e.to_string()))?;
-            ok(get_tool_versions(tools).await?)
+            let tools = optional(&args, "tools")?;
+            let prefs = optional(&args, "wslShellByTool")?;
+            ok(crate::tool_commands::get_tool_versions(tools, prefs).await.map_err(AppError::Config)?)
         }
-        "probe_tool_installations" => {
-            let tools = args
-                .get("tools")
-                .cloned()
-                .map(serde_json::from_value::<Vec<String>>)
-                .transpose()
-                .map_err(|e| AppError::Config(e.to_string()))?;
-            ok(get_tool_versions(tools).await?)
+        "probe_tool_installations" | "list_tool_installations" => {
+            let tools = take::<Vec<String>>(&args, "tools")?;
+            ok(crate::tool_commands::probe_tool_installations(tools).await.map_err(AppError::Config)?)
         }
         "run_tool_lifecycle_action" => Err(AppError::Config(
             "tool install/update actions are not available in web mode; run the installer command manually"
@@ -2145,52 +2143,128 @@ async fn set_auto_failover_enabled_web(
     app_type: String,
     enabled: bool,
 ) -> Result<(), AppError> {
-    let mut config = state.db.get_proxy_config_for_app(&app_type).await?;
-    if enabled && !config.enabled {
-        return Err(AppError::Config(
-            "需要先启用该应用的代理接管，再开启故障转移".to_string(),
-        ));
+    set_auto_failover_enabled_inner(state, app_type, enabled)
+        .await
+        .map_err(AppError::Config)
+}
+
+async fn set_auto_failover_enabled_inner(
+    state: &AppState,
+    app_type: String,
+    enabled: bool,
+) -> Result<(), String> {
+    require_failover_app(&app_type)?;
+    let app_enum = crate::app_config::AppType::from_str(&app_type)
+        .map_err(|_| format!("无效的应用类型: {app_type}"))?;
+    log::info!(
+        "[Failover] Setting auto_failover_enabled: app_type='{app_type}', enabled={enabled}"
+    );
+
+    // 读取当前配置
+    let mut config = state
+        .db
+        .get_proxy_config_for_app(&app_type)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if enabled && !crate::mode::current::is_proxy(&app_enum) {
+        return Err("需要先让该应用进入路由模式，再开启故障转移".to_string());
     }
 
+    // 队列为空时把当前供应商自动加入作为 P1，避免用户陷入"必须先加队列才能开启"的死锁
     let mut auto_added_provider_id: Option<String> = None;
     let p1_provider_id = if enabled {
-        let mut queue = state.db.get_failover_queue(&app_type)?;
+        let all_providers = state
+            .db
+            .get_all_providers(&app_type)
+            .map_err(|e| e.to_string())?;
+        let mut queue = state
+            .db
+            .get_failover_queue(&app_type)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|item| {
+                all_providers
+                    .get(&item.provider_id)
+                    .is_some_and(|provider| {
+                        crate::proxy::provider_router::provider_supports_failover(
+                            &app_type, provider,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+
         if queue.is_empty() {
-            let app_enum =
-                AppType::from_str(&app_type).map_err(|e| AppError::Config(e.to_string()))?;
-            let current_id = crate::settings::get_effective_current_provider(&state.db, &app_enum)?;
+            let current_id = crate::mode::current::provider_for(
+                &state.db,
+                &app_enum,
+                crate::mode::current::Purpose::InUse,
+            )
+            .map_err(|e| e.to_string())?;
+
             let Some(current_id) = current_id else {
-                return Err(AppError::Config(
-                    "故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string(),
-                ));
+                return Err("故障转移队列为空，且未设置当前供应商，无法开启故障转移".to_string());
             };
-            state.db.add_to_failover_queue(&app_type, &current_id)?;
+
+            require_failover_provider(&state.db, &app_type, &current_id)?;
+
+            state
+                .db
+                .add_to_failover_queue(&app_type, &current_id)
+                .map_err(|e| e.to_string())?;
             auto_added_provider_id = Some(current_id);
-            queue = state.db.get_failover_queue(&app_type)?;
+
+            queue = state
+                .db
+                .get_failover_queue(&app_type)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|item| {
+                    all_providers
+                        .get(&item.provider_id)
+                        .is_some_and(|provider| {
+                            crate::proxy::provider_router::provider_supports_failover(
+                                &app_type, provider,
+                            )
+                        })
+                })
+                .collect();
         }
+
         queue
             .first()
             .map(|item| item.provider_id.clone())
-            .ok_or_else(|| AppError::Config("故障转移队列为空，无法开启故障转移".to_string()))?
+            .ok_or_else(|| "故障转移队列为空，无法开启故障转移".to_string())?
     } else {
         String::new()
     };
 
+    // 开启前先切到 P1。只有切换成功后才写入 auto_failover_enabled=true，
+    // 避免 P1 不可切换（例如 official provider）时留下“开关已开但目标未切”的脏状态。
+    // Stack 模式不做故障转移，切换在锁内拒绝（见 `switch_route_for_failover`）。
     if enabled {
-        if let Err(error) = state
-            .proxy_service
-            .switch_proxy_target(&app_type, &p1_provider_id)
-            .await
+        if let Err(e) =
+            crate::mode::controller::switch_route_for_failover(state, &app_enum, &p1_provider_id)
+                .await
         {
             if let Some(provider_id) = auto_added_provider_id {
                 let _ = state.db.remove_from_failover_queue(&app_type, &provider_id);
             }
-            return Err(AppError::Config(error));
+            return Err(e);
         }
     }
 
+    // 更新 auto_failover_enabled 字段（enabled 是模式的镜像，保持和模式一致）
     config.auto_failover_enabled = enabled;
-    state.db.update_proxy_config_for_app(config).await?;
+    config.enabled = crate::mode::current::is_proxy(&app_enum);
+
+    // 写回数据库
+    state
+        .db
+        .update_proxy_config_for_app(config)
+        .await
+        .map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -2317,7 +2391,7 @@ async fn stream_check_provider(
     app: AppType,
     provider_id: String,
 ) -> Result<crate::services::stream_check::StreamCheckResult, AppError> {
-    let config = state.db.get_stream_check_config()?;
+    let config = crate::services::stream_check::StreamCheckConfig::default();
     let providers = state.db.get_all_providers(app.as_str())?;
     let provider = providers
         .get(&provider_id)
@@ -2326,9 +2400,6 @@ async fn stream_check_provider(
         &app, provider, &config, None,
     )
     .await?;
-    let _ = state
-        .db
-        .save_stream_check_log(&provider_id, &provider.name, app.as_str(), &result);
     Ok(result)
 }
 
@@ -2337,7 +2408,7 @@ async fn stream_check_all_providers(
     app: AppType,
     proxy_targets_only: bool,
 ) -> Result<Vec<(String, crate::services::stream_check::StreamCheckResult)>, AppError> {
-    let config = state.db.get_stream_check_config()?;
+    let config = crate::services::stream_check::StreamCheckConfig::default();
     let providers = state.db.get_all_providers(app.as_str())?;
     let allowed_ids = if proxy_targets_only {
         let mut ids = std::collections::HashSet::new();
@@ -2369,14 +2440,9 @@ async fn stream_check_all_providers(
             message: e.to_string(),
             response_time_ms: None,
             http_status: None,
-            model_used: String::new(),
             tested_at: chrono::Utc::now().timestamp(),
             retry_count: 0,
-            error_category: None,
         });
-        let _ = state
-            .db
-            .save_stream_check_log(&id, &provider.name, app.as_str(), &result);
         results.push((id, result));
     }
     Ok(results)
@@ -2394,6 +2460,14 @@ fn get_config_dir(app: String) -> Result<String, AppError> {
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
         AppType::GrokBuild => crate::grok_config::get_grok_config_dir(),
         AppType::Pi => crate::pi_config::get_pi_agent_dir()?,
+        AppType::Mcode => crate::mcode_config::config_path()
+            .parent()
+            .unwrap()
+            .to_path_buf(),
+        AppType::Kimi => crate::kimi_config::data_dir(),
+        AppType::Dsh => crate::dsh_config::data_dir(),
+        AppType::Agy => crate::agy_config::agy_dir(),
+        AppType::Omp => crate::omp_config::get_omp_agent_dir()?,
     };
     Ok(dir.to_string_lossy().to_string())
 }
@@ -2648,97 +2722,6 @@ fn import_from_deeplink_unified(
     }
 }
 
-async fn get_tool_versions(tools: Option<Vec<String>>) -> Result<Vec<ToolVersion>, AppError> {
-    const VALID_TOOLS: &[&str] = &[
-        "claude", "codex", "gemini", "opencode", "openclaw", "hermes",
-    ];
-    let requested: Vec<&str> = if let Some(tools) = tools.as_ref() {
-        VALID_TOOLS
-            .iter()
-            .copied()
-            .filter(|tool| tools.iter().any(|requested| requested == tool))
-            .collect()
-    } else {
-        VALID_TOOLS.to_vec()
-    };
-
-    let mut versions = Vec::new();
-    for tool in requested {
-        versions.push(
-            tokio::task::spawn_blocking(move || get_single_tool_version(tool))
-                .await
-                .map_err(|e| AppError::Config(format!("tool version task failed: {e}")))?,
-        );
-    }
-    Ok(versions)
-}
-
-fn get_single_tool_version(tool: &str) -> ToolVersion {
-    let output = std::process::Command::new(tool).arg("--version").output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout);
-            let fallback = String::from_utf8_lossy(&output.stderr);
-            ToolVersion {
-                name: tool.to_string(),
-                version: first_non_empty_line(&text)
-                    .or_else(|| first_non_empty_line(&fallback))
-                    .map(str::to_string),
-                latest_version: None,
-                error: None,
-                installed_but_broken: false,
-                env_type: tool_env_type(),
-                wsl_distro: None,
-            }
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            ToolVersion {
-                name: tool.to_string(),
-                version: None,
-                latest_version: None,
-                error: Some(if stderr.trim().is_empty() {
-                    stdout.trim().to_string()
-                } else {
-                    stderr.trim().to_string()
-                }),
-                installed_but_broken: true,
-                env_type: tool_env_type(),
-                wsl_distro: None,
-            }
-        }
-        Err(error) => ToolVersion {
-            name: tool.to_string(),
-            version: None,
-            latest_version: None,
-            error: Some(error.to_string()),
-            installed_but_broken: false,
-            env_type: tool_env_type(),
-            wsl_distro: None,
-        },
-    }
-}
-
-fn first_non_empty_line(text: &str) -> Option<&str> {
-    text.lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-}
-
-fn tool_env_type() -> String {
-    if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else {
-        "unknown"
-    }
-    .to_string()
-}
-
 fn is_portable_mode() -> bool {
     std::env::current_exe()
         .ok()
@@ -2827,4 +2810,118 @@ fn validate_common_config_snippet(app_type: &str, snippet: &str) -> Result<(), A
     }
 
     Ok(())
+}
+
+fn optional<T: DeserializeOwned>(args: &Value, key: &str) -> Result<Option<T>, AppError> {
+    match args.get(key).filter(|value| !value.is_null()) {
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| AppError::Config(format!("Invalid {key}: {error}"))),
+        None => Ok(None),
+    }
+}
+
+fn mode_app(args: &Value) -> Result<AppType, AppError> {
+    let app = AppType::from_str(&arg_string(args, &["appType", "app_type"])?)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    if !app.has_route_mode() {
+        return Err(AppError::Config(format!(
+            "{} does not support routing",
+            app.as_str()
+        )));
+    }
+    Ok(app)
+}
+
+fn stream_session_response(args: Value) -> Result<Response, AppError> {
+    use crate::session_manager::{cache::chunk_ranges, model::TranscriptChunk};
+    let provider = arg_string(&args, &["providerId", "provider_id"])?;
+    let path = arg_string(&args, &["sourcePath", "source_path"])?;
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    tokio::task::spawn_blocking(move || {
+        let send = |chunk: TranscriptChunk| {
+            let mut bytes = serde_json::to_vec(&chunk).expect("session chunk serialization");
+            bytes.push(b'\n');
+            sender.blocking_send(bytes).is_ok()
+        };
+        let loaded = match crate::session_manager::load_transcript(&provider, &path) {
+            Ok(loaded) => loaded,
+            Err(message) => {
+                send(TranscriptChunk::Error { message });
+                return;
+            }
+        };
+        let transcript = loaded.transcript;
+        if !send(TranscriptChunk::Header {
+            total: transcript.messages.len(),
+            turns: transcript.turns.clone(),
+            cached: loaded.cached,
+            parse_ms: loaded.parse_ms,
+        }) {
+            return;
+        }
+        for (start, end) in chunk_ranges(&transcript.message_bytes) {
+            if !send(TranscriptChunk::Messages {
+                start,
+                messages: transcript.messages[start..end].to_vec(),
+            }) {
+                return;
+            }
+        }
+        send(TranscriptChunk::Done {
+            payload_bytes: transcript.approx_bytes as u64,
+        });
+    });
+    let stream = async_stream::stream! {
+        while let Some(bytes) = receiver.recv().await {
+            yield Ok::<_, std::convert::Infallible>(bytes);
+        }
+    };
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+async fn session_image_response(args: Value) -> Result<Response, AppError> {
+    let provider = arg_string(&args, &["providerId", "provider_id"])?;
+    let path = arg_string(&args, &["sourcePath", "source_path"])?;
+    let image = take::<crate::session_manager::model::ImageRef>(&args, "image")?;
+    let bytes = tokio::task::spawn_blocking(move || {
+        let source = crate::session_manager::content::validate_source(&provider, &path)?;
+        crate::session_manager::content::load_image(&source, &image)
+    })
+    .await
+    .map_err(|error| AppError::Config(error.to_string()))?
+    .map_err(AppError::Config)?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
+}
+
+fn require_failover_app(app_type: &str) -> Result<(), String> {
+    let app = crate::app_config::AppType::from_str(app_type)
+        .map_err(|error| format!("无效的应用类型: {error}"))?;
+    if !app.supports_local_proxy() {
+        return Err(format!("{} 不支持故障转移", app.as_str()));
+    }
+    Ok(())
+}
+
+fn require_failover_provider(
+    db: &crate::database::Database,
+    app_type: &str,
+    provider_id: &str,
+) -> Result<Provider, String> {
+    let provider = db
+        .get_provider_by_id(provider_id, app_type)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("供应商不存在: {provider_id}"))?;
+    if !crate::proxy::provider_router::provider_supports_failover(app_type, &provider) {
+        return Err("Codex Official 账号卡不支持自动故障转移".to_string());
+    }
+    Ok(provider)
 }

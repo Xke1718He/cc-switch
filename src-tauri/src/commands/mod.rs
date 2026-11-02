@@ -18,7 +18,7 @@ mod hermes;
 mod import_export;
 mod kimi_oauth;
 mod mcp;
-mod misc;
+pub(crate) use crate::tool_commands as misc;
 mod model_fetch;
 mod omo;
 mod omp;

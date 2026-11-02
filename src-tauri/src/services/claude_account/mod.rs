@@ -730,7 +730,7 @@ fn delete_keychain_entry(_config_dir: &Path) {}
 /// 在账号目录里跑一次 `claude auth status --json`（只在刚登录完时调用：令牌是新的，
 /// 不会触发刷新）。
 fn auth_status(config_dir: &Path) -> Option<identity::AuthStatus> {
-    let mut cmd = crate::commands::detected_tool_command(
+    let mut cmd = crate::tool_commands::detected_tool_command(
         "claude",
         &["auth", "status", "--json"],
         STATUS_TIMEOUT,

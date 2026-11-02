@@ -15,10 +15,22 @@ name = "cc_switch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 doctest = false
 
+[[bin]]
+name = "cc-switch"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "cc-switchd"
+path = "src/bin/cc-switchd.rs"
+required-features = ["headless"]
+
 [features]
 default = ["desktop"]
 desktop = [
   "dep:tauri",
+  # A Tauri dev-dependency would pull GTK into headless tests.
+  "tauri/test",
   "dep:tauri-plugin-log",
   "dep:tauri-plugin-opener",
   "dep:tauri-plugin-process",
@@ -60,7 +72,7 @@ arboard = "3.6"
 flate2 = "1"
 brotli = "7"
 zstd = "0.13"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "process", "signal"] }
 futures = "0.3"
 async-stream = "0.3"
 bytes = "1.5"
@@ -151,4 +163,3 @@ strip = "symbols"
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"
-tauri = { version = "2.8.2", features = ["test"] }

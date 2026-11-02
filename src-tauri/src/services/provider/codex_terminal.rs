@@ -59,7 +59,7 @@ pub(crate) fn terminal_launch(
     db: &Database,
     provider: &Provider,
 ) -> Result<CodexTerminalLaunch, AppError> {
-    if crate::tray::provider_needs_routing(&AppType::Codex, provider) {
+    if super::capabilities::provider_needs_routing(&AppType::Codex, provider) {
         return Err(AppError::localized(
             "codex.terminal.needs_routing",
             format!("「{}」要经本地路由才能用，终端不能直连它", provider.name),

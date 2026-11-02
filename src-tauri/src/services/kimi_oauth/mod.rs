@@ -269,7 +269,14 @@ fn new_account(
 /// in CC Switch's language, so separate accounts sit next to it in the model
 /// picker as `Kimi 订阅 <nickname>`. Kimi only ships Chinese and English.
 fn subscription_label() -> String {
-    if crate::tray::tray_language().starts_with("zh") {
+    #[cfg(feature = "desktop")]
+    let language = crate::tray::tray_language();
+    #[cfg(not(feature = "desktop"))]
+    let language = crate::settings::get_settings()
+        .language
+        .or_else(sys_locale::get_locale)
+        .unwrap_or_else(|| "zh".into());
+    if language.starts_with("zh") {
         "Kimi 订阅".into()
     } else {
         "Kimi Subscription".into()
